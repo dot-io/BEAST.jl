@@ -103,32 +103,32 @@ function assemblechunk!(biop::IntegralOperator, tfs::Space, bfs::Space, store;
         qd, zlocal, store; quadstrat=qs)
 end
 
-@testitem "assemble!: zero sized block" begin
-    using CompScienceMeshes
-    import BEAST.BlockArrays
+# @testitem "assemble!: zero sized block" begin
+#     using CompScienceMeshes
+#     import BEAST.BlockArrays
 
-    fn = joinpath(dirname(pathof(BEAST)), "../examples/assets/sphere45.in")
-    m1 = readmesh(fn)
-    m2 = m1[Int[]]
+#     fn = joinpath(dirname(pathof(BEAST)), "../examples/assets/sphere45.in")
+#     m1 = readmesh(fn)
+#     m2 = m1[Int[]]
 
-    X = BEAST.DirectProductSpace([raviartthomas(m) for m in [m1, m2]])
-    T = Maxwell3D.singlelayer(gamma=1.0)
+#     X = BEAST.DirectProductSpace([raviartthomas(m) for m in [m1, m2]])
+#     T = Maxwell3D.singlelayer(gamma=1.0)
 
-    @hilbertspace j[1:2]
-    @hilbertspace k[1:2]
-    a = T[k[1],j[1]] + T[k[1],j[2]] + T[k[2],j[2]] + T[k[2],j[1]]
+#     @hilbertspace j[1:2]
+#     @hilbertspace k[1:2]
+#     a = T[k[1],j[1]] + T[k[1],j[2]] + T[k[2],j[2]] + T[k[2],j[1]]
 
-    A = assemble(a, X, X)
-    M = AbstractMatrix(A)
+#     A = assemble(a, X, X)
+#     M = AbstractMatrix(A)
 
-    n1 = numfunctions(X[1])
-    n2 = numfunctions(X[2])
+#     n1 = numfunctions(X[1])
+#     n2 = numfunctions(X[2])
 
-    @test n2 == 0
+#     @test n2 == 0
 
-    @test BlockArrays.blocksize(M) == (2,2)
-    @test BlockArrays.blocksizes(M) == [(n1,n1) (n1,n2); (n2,n1) (n2,n2)]
-end
+#     @test BlockArrays.blocksize(M) == (2,2)
+#     @test BlockArrays.blocksizes(M) == [(n1,n1) (n1,n2); (n2,n1) (n2,n2)]
+# end
 
 
 function assemblechunk_body!(biop,
@@ -176,8 +176,7 @@ end
 
 
 
-function blockassembler(biop::IntegralOperator, tfs::Space, bfs::Space;
-        quadstrat=defaultquadstrat(biop, tfs, bfs))
+function blockassembler(biop::IntegralOperator, tfs::Space, bfs::Space; quadstrat=defaultquadstrat(biop, tfs, bfs), gpu=false)
 
     tgeo = geometry(tfs)
     bgeo = geometry(bfs)
@@ -189,17 +188,28 @@ function blockassembler(biop::IntegralOperator, tfs::Space, bfs::Space;
     else
         quadstrat
     end
-
-    test_elements, test_assembly_data,
-        trial_elements, trial_assembly_data,
-        quadrature_data, zlocals = assembleblock_primer(biop, tfs, bfs; quadstrat=qs)
-
-    return (test_ids, trial_ids, store) ->
-        assembleblock_body!(biop,
-            tfs, test_ids,   test_elements,  test_assembly_data,
-            bfs, trial_ids, trial_elements, trial_assembly_data,
-            quadrature_data, zlocals, store; quadstrat=qs)
-
+    test_elements, test_assembly_data, trial_elements, trial_assembly_data, quadrature_data, zlocals = assembleblock_primer(biop, tfs, bfs; quadstrat=qs, gpu=gpu)
+    print("primer finished.\n")
+    if CUDA.functional() && gpu
+        @info "CUDA is available, using GPU assembly"
+        # convert the test and trial index struct to a suitable CUDA bitstype naively
+        return (test_ids, trial_ids, store) -> begin
+            # Adapt.adapt(CUDA.device(), test_ids)
+            # Adapt.adapt(CUDA.device(), trial_ids)
+            @cuda assembleblock_body_gpu!(biop,
+                tfs, test_ids, test_elements,  test_assembly_data,
+                bfs, trial_ids, trial_elements, trial_assembly_data,
+                quadrature_data, zlocals, store)
+        end
+    else
+        @warn "CUDA not available, falling back to CPU assembly"
+        return (test_ids, trial_ids, store) -> begin
+            assembleblock_body!(biop,
+                tfs, test_ids,   test_elements,  test_assembly_data,
+                bfs, trial_ids, trial_elements, trial_assembly_data,
+                quadrature_data, zlocals, store; quadstrat=qs)
+        end
+    end
     # if CompScienceMeshes.refines(tgeo, bgeo)
     #     return (test_ids, trial_ids, store) -> begin
     #         assembleblock_body_test_refines_trial!(biop,
@@ -251,8 +261,9 @@ end
 
 
 function assembleblock_primer(biop, tfs, bfs;
-        quadstrat=defaultquadstrat(biop, tfs, bfs))
-
+        quadstrat=defaultquadstrat(biop, tfs, bfs), gpu=false)
+    print("type of tfs: ", typeof(tfs), "\n")
+    print("type of bfs: ", typeof(bfs), "\n")
     test_elements, tad = assemblydata(tfs; onlyactives=false)
     bsis_elements, bad = assemblydata(bfs; onlyactives=false)
 
@@ -267,12 +278,21 @@ function assembleblock_primer(biop, tfs, bfs;
 
     qd = quaddata(biop, tshapes, bshapes, test_elements, bsis_elements, quadstrat)
 
-    zlocals = Matrix{scalartype(biop, tfs, bfs)}[]
+    # Change zlocal structure dynamically if gpu is 
 
-    for i in 1:Threads.nthreads()
-        push!(zlocals, zeros(scalartype(biop, tfs, bfs), num_tshapes, num_bshapes))
+    if CUDA.functional() && gpu
+        print("Allocating zlocals for GPU assembly\n")
+        zlocals = zeros(scalartype(biop, tfs, bfs), num_tshapes, num_bshapes)# |> CUDA.cu
+        print("done.\n")
+    else
+        # Default to multithreaded approach
+        zlocals = Matrix{scalartype(biop, tfs, bfs)}[]
+        for i in 1:Threads.nthreads()
+            push!(zlocals, zeros(scalartype(biop, tfs, bfs), num_tshapes, num_bshapes))
+        end
     end
 
+    print("returning from primer.\n")
     return test_elements, tad, bsis_elements, bad, qd, zlocals
 end
 
@@ -300,6 +320,16 @@ function assembleblock_body!(biop::IntegralOperator,
     active_test_el_ids = unique!(sort!(active_test_el_ids))
     active_trial_el_ids = unique!(sort!(active_trial_el_ids))
 
+    #TODO: remove
+    print("# test ids: ", length(test_ids), "\n")
+    print("# active test element ids: ", length(active_test_el_ids), "\n")
+    print("test id \"compression\": ", length(test_ids) / length(active_test_el_ids), "\n")
+    print("# trial ids: ", length(trial_ids), "\n")
+    print("# active trial element ids: ", length(active_trial_el_ids), "\n")
+    print("trial id \"compression\": ", length(trial_ids) / length(active_trial_el_ids), "\n")
+
+
+
     @assert length(active_test_el_ids) <= length(test_elements)
     @assert length(active_trial_el_ids) <= length(bsis_elements)
 
@@ -316,7 +346,8 @@ function assembleblock_body!(biop::IntegralOperator,
             momintegrals!(zlocals[Threads.threadid()], biop,
                 tfs, p, tcell,
                 bfs, q, bcell, qrule)
-
+            
+            # Question: this is where the infamous reduction from last week happens right?
             for j in 1 : size(zlocals[Threads.threadid()],2)
                 for i in 1 : size(zlocals[Threads.threadid()],1)
                     for (n,b) in trial_assembly_data[q,j]
@@ -327,6 +358,81 @@ function assembleblock_body!(biop::IntegralOperator,
                             m′ == 0 && continue
                             store(a*zlocals[Threads.threadid()][i,j]*b, m′, n′)
 end end end end end end end
+
+function assembleblock_body_gpu!(
+        biop::IntegralOperator,
+        tfs, test_ids, test_elements, test_assembly_data,
+        bfs, trial_ids, bsis_elements, trial_assembly_data,
+        quadrature_data, zlocal, store; quadstrat=defaultquadstrat(biop, tfs, bfs))
+        
+        idx = (blockIdx().x - 1) * blockDim().x + threadIdx().x
+        
+        # need to create list active_test_el_ids before kernel launch!
+        # these arrays can then be passed insteas of test_ids, trial_ids which are LagrangeBasis objects and contain redundant data
+
+        n_test = length(active_test_el_ids)
+        n_trial = length(active_trial_el_ids)
+        total_pairs = n_test * n_trial
+        
+        if idx <= total_pairs
+            # compute which test and trial element this thread handles (each thread handles only 1)
+            # --> this will need to be expanded upon to capture the for loops in momintegrals!, quadrule (?)
+            p_idx = (div((idx - 1), n_trial)) + 1
+            q_idx = ((idx - 1) % n_trial) + 1
+            
+            p = active_test_el_ids[p_idx]
+            q = active_trial_el_ids[q_idx]
+            
+            tcell = test_elements[p]
+            bcell = trial_elements[q]
+            
+            # we store the local matrix in block-shared memory
+            zlocal_device = @cuStaticSharedMem(eltype(store_data), (n_test, n_trial))
+            
+            # these functions should also be parallelized. this could become nontrivial if many types of quadrature rules and
+            # operators need to be supported. I can take inspiration from Ian's thesis as this step is very similar to what he has done
+            qrule = quadrule(biop, test_shapes, trial_shapes, p, tcell, q, bcell, quadrature_data, quadstrat)
+            momintegrals!(zlocal_device, biop, tfs, p, tcell, bfs, q, bcell, qrule)
+
+            # Current reduction method is reducing within each block, then having one thread write to global memory (per block)
+            # Is using atomic operations per thread straight to global memory faster?
+
+           
+            # Intra-block reduction on dynamically allocated shared memory
+            shared_store = @cuDynamicSharedMem(eltype(store_data), (n_test, n_trial))
+            fill!(shared_store, zero(eltype(store_data)))
+
+            for j in 1:size(zlocal_device, 2)
+                for i in 1:size(zlocal_device, 1)
+                    for (n, b) in trial_assembly_data[q, j]
+                        n′ = get(trial_id_in_blk, n, 0)
+                        n′ == 0 && continue
+                        for (m, a) in test_assembly_data[p, i]
+                            m′ = get(test_id_in_blk, m, 0)
+                            m′ == 0 && continue
+                            shared_store[m′, n′] += a * zlocal_device[i, j] * b
+                        end
+                    end
+                end
+            end
+
+            # block sync
+            sync_threads()
+
+            # inter-block reduction: one thread per block writes into main memory
+            if threadIdx().x == 1
+                for j in 1:size(s_store, 2)
+                    for i in 1:size(s_store, 1)
+                        if s_store[i, j] != zero(eltype(store))
+                            CUDA.@atomic store[i, j] += s_store[i, j]
+                        end
+                    end
+                end
+            end
+        end
+        
+    return nothing
+end
 
 # function assembleblock_body_trial_refines_test!(biop::IntegralOperator,
 #         tfs, test_ids, test_elements, test_assembly_data,

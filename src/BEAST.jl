@@ -1,5 +1,10 @@
 module BEAST
 
+#dev packages
+using CUDA
+import Adapt
+
+
 using Distributed
 using LinearAlgebra
 using SharedArrays
