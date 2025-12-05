@@ -188,21 +188,30 @@ function blockassembler(biop::IntegralOperator, tfs::Space, bfs::Space; quadstra
     else
         quadstrat
     end
-    test_elements, test_assembly_data, trial_elements, trial_assembly_data, quadrature_data, zlocals = assembleblock_primer(biop, tfs, bfs; quadstrat=qs, gpu=gpu)
-    print("primer finished.\n")
+
     if CUDA.functional() && gpu
         @info "CUDA is available, using GPU assembly"
+        # convert lagrangebasis to device memory
+        tfs_dev = CUDA.cu(tfs)
+        bfs_dev = CUDA.cu(bfs)
+
+
+        te_ptr, tad_ptr, tre_ptr, trad_ptr, qd_ptr, zlocals_ptr = assembleblock_primer_gpu(biop, tfs, bfs; quadstrat=qs, gpu=gpu)
         # convert the test and trial index struct to a suitable CUDA bitstype naively
         return (test_ids, trial_ids, store) -> begin
-            # Adapt.adapt(CUDA.device(), test_ids)
-            # Adapt.adapt(CUDA.device(), trial_ids)
+            testids_dev = CUDA.cu(test_ids) 
+            trialids_dev = CUDA.cu(trial_ids)
+            print("converted test and trial ids to GPU\n")
+            print(typeof(tfs_dev), "\n"
+                , typeof(bfs_dev), "\n")
             @cuda assembleblock_body_gpu!(biop,
-                tfs, test_ids, test_elements,  test_assembly_data,
-                bfs, trial_ids, trial_elements, trial_assembly_data,
-                quadrature_data, zlocals, store)
+                tfs_dev, testids_dev, te_ptr,  tad_ptr,
+                bfs_dev, trialids_dev, tre_ptr, trad_ptr,
+                qd_ptr, zlocals_ptr, store)
         end
     else
         @warn "CUDA not available, falling back to CPU assembly"
+        test_elements, test_assembly_data, trial_elements, trial_assembly_data, quadrature_data, zlocals = assembleblock_primer(biop, tfs, bfs; quadstrat=qs, gpu=gpu)
         return (test_ids, trial_ids, store) -> begin
             assembleblock_body!(biop,
                 tfs, test_ids,   test_elements,  test_assembly_data,
@@ -210,6 +219,9 @@ function blockassembler(biop::IntegralOperator, tfs::Space, bfs::Space; quadstra
                 quadrature_data, zlocals, store; quadstrat=qs)
         end
     end
+
+    print("primer finished.\n")
+
     # if CompScienceMeshes.refines(tgeo, bgeo)
     #     return (test_ids, trial_ids, store) -> begin
     #         assembleblock_body_test_refines_trial!(biop,
@@ -293,6 +305,71 @@ function assembleblock_primer(biop, tfs, bfs;
     end
 
     print("returning from primer.\n")
+    return test_elements, tad, bsis_elements, bad, qd, zlocals
+end
+
+# Define overload for BEAST's structs that need to be run on GPU
+# function Adapt.adapt_structure(to, test_elements::Vector{CompScienceMeshes.Simplex{3,2,1,3,Float64}})
+#     return [Adapt.adapt(to, e) for e in test_elements]
+# end
+
+# function Adapt.adapt_structure(to, cell::CompScienceMeshes.Simplex{3, 2, 1, 3, Float64})
+#     vertices = Adapt.adapt(to, cell.vertices)
+#     tangents = Adapt.adapt(to, cell.tangents)
+#     normals  = Adapt.adapt(to, cell.normals)
+#     volume  = Float32(cell.volume) # Float32 is the most efficient GPU numeric datatype
+#     return CompScienceMeshes.Simplex{3, 2, 1, 3, Float32}(vertices, tangents, normals, volume)
+# end
+
+# function Adapt.adapt_structure(to, vertices::SVector{3, SVector{3, Float64}})
+#     new_vertices = SVector{3, SVector{3, Float32}}(
+#         Adapt.adapt(to, vertices[1]),
+#         Adapt.adapt(to, vertices[2]),
+#         Adapt.adapt(to, vertices[3])
+#     )
+#     return new_vertices
+# end
+function Adapt.adapt_structure(to, basis::BEAST.LagrangeBasis)
+    geo = Adapt.adapt(to, basis.geo)
+    fns = Adapt.adapt(to, basis.fns)
+    pos = Adapt.adapt(to, basis.pos)
+    return BEAST.LagrangeBasis(geo, fns, pos)
+end
+
+function Adapt.adapt_structure(to, fns::Vector{Vector{BEAST.Shape{T}}}) where T
+    return [Adapt.adapt(to, fn) for fn in fns]
+end
+
+
+function assembleblock_primer_gpu(biop, tfs, bfs;
+        quadstrat=defaultquadstrat(biop, tfs, bfs), gpu=false)
+    print("type of tfs: ", typeof(tfs), "\n")
+    print("type of bfs: ", typeof(bfs), "\n")
+    test_elements, tad = assemblydata(tfs; onlyactives=false)
+    bsis_elements, bad = assemblydata(bfs; onlyactives=false)
+
+    # new_test_elements = Adapt.adapt(CUDA.CuArray, test_elements)
+    new_test_elements2  = CUDA.cu(test_elements)
+    print("Converted test elements to GPU\n", typeof(test_elements), "\n", typeof(new_test_elements2), "\n")
+
+    #Test because cu function doesnt seem to work
+    cpu = Diagonal([1, 2])
+    gpu = CUDA.cu(cpu)
+    print("Test cu function on docs example: ", typeof(gpu), "\n")
+
+    tgeo = geometry(tfs)
+    bgeo = geometry(bfs)
+
+    tdom = domain(chart(tgeo, first(tgeo)))
+    bdom = domain(chart(bgeo, first(bgeo)))
+
+    tshapes = refspace(tfs); num_tshapes = numfunctions(tshapes, tdom)
+    bshapes = refspace(bfs); num_bshapes = numfunctions(bshapes, bdom)
+    qd = quaddata(biop, tshapes, bshapes, test_elements, bsis_elements, quadstrat)
+    
+    zlocals = zeros(scalartype(biop, tfs, bfs), num_tshapes, num_bshapes)
+    print("Getting information on primer datatypes\nelements types:", typeof(test_elements), ", ", typeof(bsis_elements), "\n"
+    , "assembly data types: ", typeof(tad), ", ", typeof(bad), "\n", "quadrature data type: ", typeof(qd), "\n", "zlocal type: ", typeof(zlocals), "\n")
     return test_elements, tad, bsis_elements, bad, qd, zlocals
 end
 
