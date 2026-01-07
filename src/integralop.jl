@@ -192,8 +192,8 @@ function blockassembler(biop::IntegralOperator, tfs::Space, bfs::Space; quadstra
     if CUDA.functional() && gpu
         @info "CUDA is available, using GPU assembly"
         # convert lagrangebasis to device memory
-        tfs_dev = CUDA.cu(tfs)
-        bfs_dev = CUDA.cu(bfs)
+        tfs_dev = to_gpu(tfs)
+        bfs_dev = to_gpu(bfs)
 
 
         te_ptr, tad_ptr, tre_ptr, trad_ptr, qd_ptr, zlocals_ptr = assembleblock_primer_gpu(biop, tfs, bfs; quadstrat=qs, gpu=gpu)
@@ -329,17 +329,66 @@ end
 #     )
 #     return new_vertices
 # end
-function Adapt.adapt_structure(to, basis::BEAST.LagrangeBasis)
+
+# GPU-adapted LagrangeBasis definition
+# Immutable version for GPU
+struct LagrangeBasisGPU{D,C,T,V}
+    geo_vertices::CuArray{SVector{3,Float32}}
+    geo_faces::CuArray{SVector{3,Int32}}
+    shapes_cellid::CuArray{Int32}
+    shapes_refid::CuArray{Int32}
+    shapes_coeff::CuArray{Float32}
+    pos::CuArray{SVector{3,Float32}}
+    offsets::CuArray{Int32}
+end
+
+# Conversion function
+function to_gpu(basis::LagrangeBasis)
+	shapes = reduce(vcat, basis.fns)
+	
+	vertices = [SVector{3, Float32} for v in basis.geo.vertices]
+	faces = [SVector{3, Int32} for f in basis.geo.faces]
+	cell_ids = Int32[s.cellid for s in shapes]
+	ref_ids = Int32[s.refid for s in shapes] 
+	coeffs = Float32[s.coeff for s in shapes] 
+	positions = [SVector{3, Float32}(p) for p in basis.pos]
+	offsets = Int32.(cumsum([0; length.(basis.fns)]))
+	
+	cu_vertices = CUDA.cu(vertices)
+	cu_faces = CUDA.cu(faces)
+	cu_cell_ids = CUDA.cu(cell_ids)
+	cu_ref_ids = CUDA.cu(ref_ids)
+	cu_coeffs = CUDA.cu(coeffs)
+	cu_positons = CUDA.cu(positions)
+	cu_offsets = CUDA.cu(offsets)
+	
+	return LagrangeBasisGPU(
+		cu_vertices,
+		cu_faces,
+		cu_cell_ids,
+		cu_ref_ids,
+		cu_coeffs,
+		cu_positions,
+		cu_offsets
+	    )
+end
+
+function Adapt.adapt_structure(to, basis::BEAST.LagrangeBasis{D,C,M,T,NF,P} where {D,C,M,T,NF,P})
     geo = Adapt.adapt(to, basis.geo)
     fns = Adapt.adapt(to, basis.fns)
     pos = Adapt.adapt(to, basis.pos)
-    return BEAST.LagrangeBasis(geo, fns, pos)
+    return BEAST.LagrangeBasis{D,C,M,T,NF,P}(geo, fns, pos) where {D,C,M,T,NF,P}
 end
 
 function Adapt.adapt_structure(to, fns::Vector{Vector{BEAST.Shape{T}}}) where T
-    return [Adapt.adapt(to, fn) for fn in fns]
+	return [Adapt.adapt(to, fn) for fn in fns]
 end
 
+function Adapt.adapt_structure(to, geo::CompScienceMeshes.Mesh{U,D1,T}) where {U, D1, T}
+	vertices = Adapt.adapt(to, geo.vertices)
+	faces = Adapt.adapt(to, geo.faces)
+	return CompScienceMeshes.Mesh(vertices, faces)
+end
 
 function assembleblock_primer_gpu(biop, tfs, bfs;
         quadstrat=defaultquadstrat(biop, tfs, bfs), gpu=false)
