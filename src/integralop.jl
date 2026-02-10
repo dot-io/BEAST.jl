@@ -195,19 +195,53 @@ function blockassembler(biop::IntegralOperator, tfs::Space, bfs::Space; quadstra
         tfs_dev = to_gpu(tfs)
         bfs_dev = to_gpu(bfs)
 
-
         te_ptr, tad_ptr, tre_ptr, trad_ptr, qd_ptr, zlocals_ptr = assembleblock_primer_gpu(biop, tfs, bfs; quadstrat=qs, gpu=gpu)
         # convert the test and trial index struct to a suitable CUDA bitstype naively
         return (test_ids, trial_ids, store) -> begin
-            testids_dev = CUDA.cu(test_ids) 
-            trialids_dev = CUDA.cu(trial_ids)
-            print("converted test and trial ids to GPU\n")
-            print(typeof(tfs_dev), "\n"
-                , typeof(bfs_dev), "\n")
-            @cuda assembleblock_body_gpu!(biop,
-                tfs_dev, testids_dev, te_ptr,  tad_ptr,
-                bfs_dev, trialids_dev, tre_ptr, trad_ptr,
-                qd_ptr, zlocals_ptr, store)
+            active_test_el_ids = Int32[]
+            active_trial_el_ids = Int32[]
+            for m in test_ids, sh in tfs.fns[m]
+                push!(active_test_el_ids, Int32(sh.cellid))
+            end
+            for m in trial_ids, sh in bfs.fns[m]
+                push!(active_trial_el_ids, Int32(sh.cellid))
+            end
+            active_test_el_ids = unique!(sort!(active_test_el_ids))
+            active_trial_el_ids = unique!(sort!(active_trial_el_ids))
+
+            test_id_in_blk = fill(Int32(0), numfunctions(tfs))
+            trial_id_in_blk = fill(Int32(0), numfunctions(bfs))
+            for (i, m) in enumerate(test_ids)
+                test_id_in_blk[m] = Int32(i)
+            end
+            for (i, m) in enumerate(trial_ids)
+                trial_id_in_blk[m] = Int32(i)
+            end
+
+            active_test_el_ids_dev = CUDA.cu(active_test_el_ids)
+            active_trial_el_ids_dev = CUDA.cu(active_trial_el_ids)
+            test_id_in_blk_dev = CUDA.cu(test_id_in_blk)
+            trial_id_in_blk_dev = CUDA.cu(trial_id_in_blk)
+
+            store_dev = CUDA.zeros(eltype(zlocals_ptr), length(test_ids), length(trial_ids))
+            total_pairs = length(active_test_el_ids) * length(active_trial_el_ids)
+            total_pairs == 0 && return
+            threads = 256
+            blocks = cld(total_pairs, threads)
+            @cuda threads=threads blocks=blocks assembleblock_body_gpu!(
+                tad_ptr, trad_ptr,
+                active_test_el_ids_dev, active_trial_el_ids_dev,
+                test_id_in_blk_dev, trial_id_in_blk_dev,
+                zlocals_ptr, store_dev)
+
+            store_host = Array(store_dev)
+            for j in 1:size(store_host, 2)
+                for i in 1:size(store_host, 1)
+                    v = store_host[i, j]
+                    v == zero(v) && continue
+                    store(v, i, j)
+                end
+            end
         end
     else
         @warn "CUDA not available, falling back to CPU assembly"
@@ -332,7 +366,7 @@ end
 
 # GPU-adapted LagrangeBasis definition
 # Immutable version for GPU
-struct LagrangeBasisGPU{D,C,T,V}
+struct LagrangeBasisGPU
     geo_vertices::CuArray{SVector{3,Float32}}
     geo_faces::CuArray{SVector{3,Int32}}
     shapes_cellid::CuArray{Int32}
@@ -342,12 +376,12 @@ struct LagrangeBasisGPU{D,C,T,V}
     offsets::CuArray{Int32}
 end
 
-# Conversion function
-function to_gpu(basis::LagrangeBasis)
+
+function LagrangeBasisGPU(basis::LagrangeBasis)
 	shapes = reduce(vcat, basis.fns)
 	
-	vertices = [SVector{3, Float32} for v in basis.geo.vertices]
-	faces = [SVector{3, Int32} for f in basis.geo.faces]
+	vertices = [SVector{3, Float32}(v) for v in basis.geo.vertices]
+	faces = [SVector{3, Int32}(f) for f in basis.geo.faces]
 	cell_ids = Int32[s.cellid for s in shapes]
 	ref_ids = Int32[s.refid for s in shapes] 
 	coeffs = Float32[s.coeff for s in shapes] 
@@ -359,7 +393,7 @@ function to_gpu(basis::LagrangeBasis)
 	cu_cell_ids = CUDA.cu(cell_ids)
 	cu_ref_ids = CUDA.cu(ref_ids)
 	cu_coeffs = CUDA.cu(coeffs)
-	cu_positons = CUDA.cu(positions)
+	cu_positions = CUDA.cu(positions)
 	cu_offsets = CUDA.cu(offsets)
 	
 	return LagrangeBasisGPU(
@@ -372,6 +406,8 @@ function to_gpu(basis::LagrangeBasis)
 		cu_offsets
 	    )
 end
+
+to_gpu(basis::LagrangeBasis) = LagrangeBasisGPU(basis)
 
 function Adapt.adapt_structure(to, basis::BEAST.LagrangeBasis{D,C,M,T,NF,P} where {D,C,M,T,NF,P})
     geo = Adapt.adapt(to, basis.geo)
@@ -397,15 +433,6 @@ function assembleblock_primer_gpu(biop, tfs, bfs;
     test_elements, tad = assemblydata(tfs; onlyactives=false)
     bsis_elements, bad = assemblydata(bfs; onlyactives=false)
 
-    # new_test_elements = Adapt.adapt(CUDA.CuArray, test_elements)
-    new_test_elements2  = CUDA.cu(test_elements)
-    print("Converted test elements to GPU\n", typeof(test_elements), "\n", typeof(new_test_elements2), "\n")
-
-    #Test because cu function doesnt seem to work
-    cpu = Diagonal([1, 2])
-    gpu = CUDA.cu(cpu)
-    print("Test cu function on docs example: ", typeof(gpu), "\n")
-
     tgeo = geometry(tfs)
     bgeo = geometry(bfs)
 
@@ -417,9 +444,10 @@ function assembleblock_primer_gpu(biop, tfs, bfs;
     qd = quaddata(biop, tshapes, bshapes, test_elements, bsis_elements, quadstrat)
     
     zlocals = zeros(scalartype(biop, tfs, bfs), num_tshapes, num_bshapes)
-    print("Getting information on primer datatypes\nelements types:", typeof(test_elements), ", ", typeof(bsis_elements), "\n"
-    , "assembly data types: ", typeof(tad), ", ", typeof(bad), "\n", "quadrature data type: ", typeof(qd), "\n", "zlocal type: ", typeof(zlocals), "\n")
-    return test_elements, tad, bsis_elements, bad, qd, zlocals
+    tad_dev = CUDA.cu(tad.data)
+    bad_dev = CUDA.cu(bad.data)
+    zlocals_dev = CUDA.cu(zlocals)
+    return test_elements, tad_dev, bsis_elements, bad_dev, qd, zlocals_dev
 end
 
 function assembleblock_body!(biop::IntegralOperator,
@@ -486,77 +514,43 @@ function assembleblock_body!(biop::IntegralOperator,
 end end end end end end end
 
 function assembleblock_body_gpu!(
-        biop::IntegralOperator,
-        tfs, test_ids, test_elements, test_assembly_data,
-        bfs, trial_ids, bsis_elements, trial_assembly_data,
-        quadrature_data, zlocal, store; quadstrat=defaultquadstrat(biop, tfs, bfs))
-        
-        idx = (blockIdx().x - 1) * blockDim().x + threadIdx().x
-        
-        # need to create list active_test_el_ids before kernel launch!
-        # these arrays can then be passed insteas of test_ids, trial_ids which are LagrangeBasis objects and contain redundant data
+        test_assembly_data, trial_assembly_data,
+        active_test_el_ids, active_trial_el_ids,
+        test_id_in_blk, trial_id_in_blk,
+        zlocal, store)
+    idx = (blockIdx().x - 1) * blockDim().x + threadIdx().x
+    n_test = length(active_test_el_ids)
+    n_trial = length(active_trial_el_ids)
+    total_pairs = n_test * n_trial
 
-        n_test = length(active_test_el_ids)
-        n_trial = length(active_trial_el_ids)
-        total_pairs = n_test * n_trial
-        
-        if idx <= total_pairs
-            # compute which test and trial element this thread handles (each thread handles only 1)
-            # --> this will need to be expanded upon to capture the for loops in momintegrals!, quadrule (?)
-            p_idx = (div((idx - 1), n_trial)) + 1
-            q_idx = ((idx - 1) % n_trial) + 1
-            
-            p = active_test_el_ids[p_idx]
-            q = active_trial_el_ids[q_idx]
-            
-            tcell = test_elements[p]
-            bcell = trial_elements[q]
-            
-            # we store the local matrix in block-shared memory
-            zlocal_device = @cuStaticSharedMem(eltype(store_data), (n_test, n_trial))
-            
-            # these functions should also be parallelized. this could become nontrivial if many types of quadrature rules and
-            # operators need to be supported. I can take inspiration from Ian's thesis as this step is very similar to what he has done
-            qrule = quadrule(biop, test_shapes, trial_shapes, p, tcell, q, bcell, quadrature_data, quadstrat)
-            momintegrals!(zlocal_device, biop, tfs, p, tcell, bfs, q, bcell, qrule)
+    if idx <= total_pairs
+        p_idx = (div((idx - 1), n_trial)) + 1
+        q_idx = ((idx - 1) % n_trial) + 1
 
-            # Current reduction method is reducing within each block, then having one thread write to global memory (per block)
-            # Is using atomic operations per thread straight to global memory faster?
+        p = Int(active_test_el_ids[p_idx])
+        q = Int(active_trial_el_ids[q_idx])
 
-           
-            # Intra-block reduction on dynamically allocated shared memory
-            shared_store = @cuDynamicSharedMem(eltype(store_data), (n_test, n_trial))
-            fill!(shared_store, zero(eltype(store_data)))
-
-            for j in 1:size(zlocal_device, 2)
-                for i in 1:size(zlocal_device, 1)
-                    for (n, b) in trial_assembly_data[q, j]
-                        n′ = get(trial_id_in_blk, n, 0)
-                        n′ == 0 && continue
-                        for (m, a) in test_assembly_data[p, i]
-                            m′ = get(test_id_in_blk, m, 0)
-                            m′ == 0 && continue
-                            shared_store[m′, n′] += a * zlocal_device[i, j] * b
-                        end
-                    end
-                end
-            end
-
-            # block sync
-            sync_threads()
-
-            # inter-block reduction: one thread per block writes into main memory
-            if threadIdx().x == 1
-                for j in 1:size(s_store, 2)
-                    for i in 1:size(s_store, 1)
-                        if s_store[i, j] != zero(eltype(store))
-                            CUDA.@atomic store[i, j] += s_store[i, j]
-                        end
+        for j in 1:size(zlocal, 2)
+            for i in 1:size(zlocal, 1)
+                zval = zlocal[i, j]
+                zval == zero(zval) && continue
+                for k in 1:size(trial_assembly_data, 1)
+                    n, b = trial_assembly_data[k, j, q]
+                    n == 0 && break
+                    npos = Int(trial_id_in_blk[n])
+                    npos == 0 && continue
+                    for l in 1:size(test_assembly_data, 1)
+                        m, a = test_assembly_data[l, i, p]
+                        m == 0 && break
+                        mpos = Int(test_id_in_blk[m])
+                        mpos == 0 && continue
+                        CUDA.@atomic store[mpos, npos] += a * zval * b
                     end
                 end
             end
         end
-        
+    end
+
     return nothing
 end
 
@@ -824,6 +818,3 @@ function assemblecol_body!(biop,
                 for (m,a) in test_assembly_data[p,i]
                     store(a*zlocal[i,j]*b, m, 1)
 end end end end end
-
-
-
