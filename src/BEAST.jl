@@ -238,6 +238,7 @@ include("operators/theta.jl")
 
 include("quadrature/rules/momintegrals.jl")
 include("quadrature/doublenumints.jl")
+include("gpu.jl")
 include("quadrature/singularityextractionints.jl")
 include("quadrature/SauterSchwabQuadrature1D.jl")
 include("quadrature/sauterschwabints.jl")
