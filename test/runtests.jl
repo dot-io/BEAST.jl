@@ -100,8 +100,13 @@ include("test_analytic_excitation.jl")
 include("test_vie.jl")
 include("test_evie_dvie.jl")
 
-@run_package_tests filter=ti->!(:example in ti.tags) verbose=true
+include("test_coloring.jl")
 
+@run_package_tests filter = ti -> begin
+    # @show ti.tags
+    # @show isempty(intersect([:example, :diagnostics], ti.tags))
+    isempty(intersect([:example, :diagnostics], ti.tags))
+end verbose = true
 
 try
     Pkg.installed("BogaertInts10")

@@ -20,8 +20,268 @@
 #     return new_vertices
 # end
 
-# GPU-adapted LagrangeBasis definition
-# Immutable version for GPU
+function blockassembler_gpu(biop::IntegralOperator, tfs::Space, bfs::Space; quadstrat=defaultquadstrat(biop, tfs, bfs), gpu=false)
+
+    tgeo = geometry(tfs)
+    bgeo = geometry(bfs)
+    tdom = domain(chart(tgeo, first(tgeo)))
+    bdom = domain(chart(bgeo, first(bgeo)))
+    test_shapes = refspace(tfs)
+    trial_shapes = refspace(bfs)
+    num_tshapes = numfunctions(test_shapes, tdom)
+    num_bshapes = numfunctions(trial_shapes, bdom)
+
+    qs = if CompScienceMeshes.refines(tgeo, bgeo)
+        TestRefinesTrialQStrat(quadstrat)
+    elseif CompScienceMeshes.refines(bgeo, tgeo)
+        TrialRefinesTestQStrat(quadstrat)
+    else
+        quadstrat
+    end
+
+    if CUDA.functional() && gpu
+        @info "CUDA is available, using GPU assembly"
+        # convert lagrangebasis to device memory
+        tfs_dev = to_gpu(tfs)
+        bfs_dev = to_gpu(bfs)
+
+        gpu_momintegrals_ok = Ref(true)
+        gpu_momintegrals_checked = Ref(false)
+
+        test_elements, test_assembly_dev, trial_elements, trial_assembly_dev, quadrature_data, zlocals_dev, test_cell_ptrs, trial_cell_ptrs = assembleblock_primer_gpu(biop, tfs, bfs; quadstrat=qs, gpu=gpu)
+        # convert the test and trial index struct to a suitable CUDA bitstype naively
+        return (test_ids, trial_ids, store) -> begin
+            active_test_el_ids = Int32[]
+            active_trial_el_ids = Int32[]
+            for m in test_ids, sh in tfs.fns[m]
+                push!(active_test_el_ids, Int32(sh.cellid))
+            end
+            for m in trial_ids, sh in bfs.fns[m]
+                push!(active_trial_el_ids, Int32(sh.cellid))
+            end
+            active_test_el_ids = unique!(sort!(active_test_el_ids))
+            active_trial_el_ids = unique!(sort!(active_trial_el_ids))
+
+            test_id_in_blk = fill(Int32(0), numfunctions(tfs))
+            trial_id_in_blk = fill(Int32(0), numfunctions(bfs))
+            for (i, m) in enumerate(test_ids)
+                test_id_in_blk[m] = Int32(i)
+            end
+            for (i, m) in enumerate(trial_ids)
+                trial_id_in_blk[m] = Int32(i)
+            end
+
+            test_id_in_blk_dev = CUDA.cu(test_id_in_blk)
+            trial_id_in_blk_dev = CUDA.cu(trial_id_in_blk)
+
+            total_pairs = length(active_test_el_ids) * length(active_trial_el_ids)
+            store_dev = CUDA.zeros(eltype(zlocals_dev), length(test_ids), length(trial_ids))
+            kernel_time = 0.0
+            total_time = @elapsed begin
+                if total_pairs > 0
+                    zlocal_host = zeros(scalartype(biop, tfs, bfs), num_tshapes, num_bshapes)
+                    zlocal_dev = zlocals_dev
+                    pair_p = Int32[]
+                    pair_q = Int32[]
+                    outer_offsets = Int32[]
+                    outer_lengths = Int32[]
+                    inner_offsets = Int32[]
+                    inner_lengths = Int32[]
+                    outer_points = nothing
+                    inner_points = nothing
+                    outer_offset = 0
+                    inner_offset = 0
+                    all_compatible = true
+
+                    for p in active_test_el_ids
+                        tcell = test_elements[p]
+                        tptr = test_cell_ptrs[p]
+                        for q in active_trial_el_ids
+                            bcell = trial_elements[q]
+                            bptr = trial_cell_ptrs[q]
+                            qrule = quadrule(biop, test_shapes, trial_shapes, p, tcell, q, bcell, quadrature_data, qs)
+
+                            if !(can_use_gpu_momintegrals(qrule) && gpu_momintegrals_ok[])
+                                all_compatible = false
+                                break
+                            end
+
+                            if !gpu_momintegrals_checked[]
+                                try
+                                    fill!(zlocal_dev, 0)
+                                    momintegrals!(biop, test_shapes, trial_shapes, tcell, bcell, zlocal_dev, qrule)
+                                    fill!(zlocal_host, 0)
+                                    momintegrals!(zlocal_host, biop, tfs, tptr, tcell, bfs, bptr, bcell, qrule)
+                                    zlocal_gpu_host = Array(zlocal_dev)
+                                    diff = maximum(abs.(zlocal_gpu_host - zlocal_host))
+                                    if diff > 1e-8 * max(1.0, maximum(abs.(zlocal_host)))
+                                        gpu_momintegrals_ok[] = false
+                                        all_compatible = false
+                                        @warn "GPU momintegrals mismatch; falling back to CPU" diff=diff
+                                        break
+                                    else
+                                        gpu_momintegrals_checked[] = true
+                                    end
+                                catch err
+                                    gpu_momintegrals_ok[] = false
+                                    all_compatible = false
+                                    @warn "GPU momintegrals disabled; falling back to CPU" err
+                                    break
+                                end
+                            end
+
+                            if outer_points === nothing
+                                outer_points = Vector{eltype(qrule.outer_quad_points)}()
+                                inner_points = Vector{eltype(qrule.inner_quad_points)}()
+                            elseif eltype(qrule.outer_quad_points) != eltype(outer_points) ||
+                                   eltype(qrule.inner_quad_points) != eltype(inner_points)
+                                all_compatible = false
+                                break
+                            end
+
+                            push!(pair_p, Int32(p))
+                            push!(pair_q, Int32(q))
+                            push!(outer_offsets, Int32(outer_offset + 1))
+                            olen = length(qrule.outer_quad_points)
+                            push!(outer_lengths, Int32(olen))
+                            append!(outer_points, qrule.outer_quad_points)
+                            outer_offset += olen
+                            push!(inner_offsets, Int32(inner_offset + 1))
+                            ilen = length(qrule.inner_quad_points)
+                            push!(inner_lengths, Int32(ilen))
+                            append!(inner_points, qrule.inner_quad_points)
+                            inner_offset += ilen
+                        end
+                        all_compatible || break
+                    end
+
+                    if all_compatible && !isempty(pair_p)
+                        pair_p_dev = CUDA.cu(pair_p)
+                        pair_q_dev = CUDA.cu(pair_q)
+                        outer_offsets_dev = CUDA.cu(outer_offsets)
+                        outer_lengths_dev = CUDA.cu(outer_lengths)
+                        inner_offsets_dev = CUDA.cu(inner_offsets)
+                        inner_lengths_dev = CUDA.cu(inner_lengths)
+                        outer_points_dev = CUDA.cu(outer_points)
+                        inner_points_dev = CUDA.cu(inner_points)
+
+                        total_work = length(pair_p) * num_tshapes * num_bshapes
+                        threads = 256
+                        blocks = cld(total_work, threads)
+                        kernel_time += @elapsed begin
+                            @cuda threads=threads blocks=blocks momintegrals_assemble_pairs_kernel!(
+                                store_dev, biop,
+                                pair_p_dev, pair_q_dev,
+                                outer_points_dev, outer_offsets_dev, outer_lengths_dev,
+                                inner_points_dev, inner_offsets_dev, inner_lengths_dev,
+                                test_assembly_dev, trial_assembly_dev,
+                                test_id_in_blk_dev, trial_id_in_blk_dev,
+                                Int32(num_tshapes), Int32(num_bshapes))
+                            CUDA.synchronize()
+                        end
+                    else
+                        for p in active_test_el_ids
+                            tcell = test_elements[p]
+                            tptr = test_cell_ptrs[p]
+                            for q in active_trial_el_ids
+                                bcell = trial_elements[q]
+                                bptr = trial_cell_ptrs[q]
+                                qrule = quadrule(biop, test_shapes, trial_shapes, p, tcell, q, bcell, quadrature_data, qs)
+
+                            if gpu_momintegrals_ok[]
+                                    try
+                                        fill!(zlocal_dev, 0)
+                                        momintegrals!(biop, test_shapes, trial_shapes, tcell, bcell, zlocal_dev, qrule)
+                                        if !gpu_momintegrals_checked[]
+                                            fill!(zlocal_host, 0)
+                                            momintegrals!(zlocal_host, biop, tfs, tptr, tcell, bfs, bptr, bcell, qrule)
+                                            zlocal_gpu_host = Array(zlocal_dev)
+                                            diff = maximum(abs.(zlocal_gpu_host - zlocal_host))
+                                            if diff > 1e-8 * max(1.0, maximum(abs.(zlocal_host)))
+                                                gpu_momintegrals_ok[] = false
+                                                @warn "GPU momintegrals mismatch; falling back to CPU" diff=diff
+                                                copyto!(zlocal_dev, zlocal_host)
+                                            else
+                                                gpu_momintegrals_checked[] = true
+                                            end
+                                        end
+                                    catch err
+                                        gpu_momintegrals_ok[] = false
+                                        @warn "GPU momintegrals disabled; falling back to CPU" err
+                                        fill!(zlocal_host, 0)
+                                        momintegrals!(zlocal_host, biop, tfs, tptr, tcell, bfs, bptr, bcell, qrule)
+                                        copyto!(zlocal_dev, zlocal_host)
+                                    end
+                                else
+                                    fill!(zlocal_host, 0)
+                                    momintegrals!(zlocal_host, biop, tfs, tptr, tcell, bfs, bptr, bcell, qrule)
+                                    copyto!(zlocal_dev, zlocal_host)
+                                end
+
+                                active_test_el_ids_dev = CUDA.cu(Int32[p])
+                                active_trial_el_ids_dev = CUDA.cu(Int32[q])
+                                kernel_time += @elapsed begin
+                                    @cuda threads=256 blocks=1 assembleblock_body_gpu!(
+                                        test_assembly_dev, trial_assembly_dev,
+                                        active_test_el_ids_dev, active_trial_el_ids_dev,
+                                        test_id_in_blk_dev, trial_id_in_blk_dev,
+                                        zlocal_dev, store_dev)
+                                    CUDA.synchronize()
+                                end
+                            end
+                        end
+                    end
+
+                    store_host = Array(store_dev)
+                    for j in 1:size(store_host, 2)
+                        for i in 1:size(store_host, 1)
+                            v = store_host[i, j]
+                            v == zero(v) && continue
+                            store(v, i, j)
+                        end
+                    end
+                end
+            end
+            @info "GPU assembleblock timing" kernel_time=kernel_time total_time=total_time total_pairs=total_pairs
+        end
+    else
+        @warn "CUDA not available, falling back to CPU assembly"
+        test_elements, test_assembly_data, trial_elements, trial_assembly_data, quadrature_data, zlocals = assembleblock_primer(biop, tfs, bfs; quadstrat=qs, gpu=gpu)
+        return (test_ids, trial_ids, store) -> begin
+            cpu_time = @elapsed assembleblock_body!(biop,
+                tfs, test_ids,   test_elements,  test_assembly_data,
+                bfs, trial_ids, trial_elements, trial_assembly_data,
+                quadrature_data, zlocals, store; quadstrat=qs)
+            @info "CPU assembleblock timing" time=cpu_time
+        end
+    end
+
+    print("primer finished.\n")
+
+    # if CompScienceMeshes.refines(tgeo, bgeo)
+    #     return (test_ids, trial_ids, store) -> begin
+    #         assembleblock_body_test_refines_trial!(biop,
+    #             tfs, test_ids,   test_elements,  test_assembly_data,
+    #             bfs, trial_ids, trial_elements, trial_assembly_data,
+    #             quadrature_data, zlocals, store; quadstrat)
+    #     end
+    # elseif CompScienceMeshes.refines(bgeo, tgeo)
+    #     return (test_ids, trial_ids, store) -> begin
+    #         assembleblock_body_trial_refines_test!(biop,
+    #             tfs, test_ids,   test_elements,  test_assembly_data,
+    #             bfs, trial_ids, trial_elements, trial_assembly_data,
+    #             quadrature_data, zlocals, store; quadstrat)
+    #     end
+    # else
+    #     return (test_ids, trial_ids, store) -> begin
+    #         assembleblock_body!(biop,
+    #             tfs, test_ids,   test_elements,  test_assembly_data,
+    #             bfs, trial_ids, trial_elements, trial_assembly_data,
+    #             quadrature_data, zlocals, store; quadstrat)
+    #     end
+    # end
+end
+
 struct LagrangeBasisGPU
     geo_vertices::CuArray{SVector{3,Float64}}
     geo_faces::CuArray{SVector{3,Int32}}
