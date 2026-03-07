@@ -264,7 +264,13 @@ function assemblydata(basis::Space; onlyactives=true)
     max_celltonum = maximum(celltonum)
     fill!(celltonum, 0)
     data = fill((0,zero(T)), max_celltonum, num_refs, num_active_cells)
+    print("Asserting loop size of assemblydata to see if interesting to launch on GPU\n")
+    print("Number of basis functions iterated in assemblydata: ", num_bfs, "\n")
+
     for b in 1 : num_bfs
+
+        # print("Number of shapes iterated in assemblydata (inner loop): ", basisfunction(basis, b), "\n")
+
         for shape in basisfunction(basis, b)
             c = shape.cellid
             l = index_among_actives[c]
