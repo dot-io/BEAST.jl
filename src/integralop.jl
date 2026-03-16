@@ -158,6 +158,8 @@ function assemblechunk_body!(biop,
         momintegrals!(zlocal, biop,
             test_space,  tptr, tcell,
             trial_space, bptr, bcell, qrule)
+
+    
         I = length(test_assembly_data[p])
         J = length(trial_assembly_data[q])
         for j in 1 : J, i in 1 : I

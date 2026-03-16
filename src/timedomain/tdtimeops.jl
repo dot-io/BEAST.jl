@@ -125,11 +125,11 @@ function assemble!(operator::TensorOperator, testfns::SpaceTimeBasis, trialfns::
 end
 
 
-mutable struct TemporalDifferentiation <: AbstractOperator
+mutable struct TemporalDifferentiation <: AbstractSpaceTimeOperator
     operator
 end
 
-derive(op::AbstractOperator) = TemporalDifferentiation(op)
+derive(op::AbstractSpaceTimeOperator) = TemporalDifferentiation(op)
 scalartype(op::TemporalDifferentiation) = scalartype(op.operator)
 Base.:*(a::Number, op::TemporalDifferentiation) = TemporalDifferentiation(a * op.operator)
 
@@ -200,6 +200,6 @@ function assemble!(operator::TemporalIntegration, testfns, trialfns, store,
         integrate(trial_time_fns)
     )
 
-    assemble!(operator.operator, testfns, trialfns, store; quadstrat)
+    assemble!(operator.operator, testfns, trialfns, store, threading; quadstrat)
 
 end

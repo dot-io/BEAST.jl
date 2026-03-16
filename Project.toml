@@ -1,6 +1,6 @@
 name = "BEAST"
 uuid = "bb4162c7-ba94-5a20-af32-d8ec4428bdd1"
-version = "2.8.0"
+version = "2.9.0"
 
 [deps]
 AbstractTrees = "1520ce14-60c1-5f80-bbc7-55ef81b5835c"
@@ -40,14 +40,20 @@ Suppressor = "fd094767-a336-5f1f-9728-57cf17d0bbfb"
 TestItems = "1c621080-faea-4a02-84b6-bbd5e436b8fe"
 WiltonInts84 = "a3e2863e-c0ee-5ff6-a523-307a4cdc8724"
 
+[weakdeps]
+CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
+
+[extensions]
+BEASTCUDAExt = "CUDA"
+
 [compat]
 AbstractTrees = "0.4.4"
 Adapt = "4.4.0"
 BlockArrays = "1"
-CUDA = "5.9.5"
+CUDA = "5.10.1"
 CollisionDetection = "0.1.7"
 Combinatorics = "0.7, 1"
-CompScienceMeshes = "0.10"
+CompScienceMeshes = "0.11"
 Compat = "2, 3, 4"
 ConvolutionOperators = "0.4"
 ExtendableSparse = "1.4"
