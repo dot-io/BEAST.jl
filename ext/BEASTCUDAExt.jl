@@ -1,27 +1,16 @@
 module BEASTCUDAExt
 
 using CUDA
-using CUDA.Adapt
-using CUDA.CUSPARSE
-
-using BEAST
-import BEAST: assemble!, Threading, Operator, Space, IntegralOperator
-import BEAST: _integrands, _integrands_gen, RTRefSpace, Integrand, pulledback_integrand
-using BEAST.CompScienceMeshes
-using BEAST.SauterSchwabQuadrature
-using BEAST.StaticArrays
-using BEAST.SparseArrays
-using BEAST.LinearAlgebra
+using BEAST: BEAST, Integrand, scalartype, numfunctions, geometry, refspace
+using CompScienceMeshes: MeshPointNM, Simplex, domain, chart
+using StaticArrays: SVector
 
 
-Adapt.@adapt_structure CommonVertex
-Adapt.@adapt_structure CommonEdge
-Adapt.@adapt_structure CommonFace
+include("utils.jl")
+
+VERSION = 4
+include("gpu_v$VERSION.jl")
 
 
-include("gpu_utils.jl")
-# include("gpu_basis.jl")
-include("gpu_integrals.jl")
-include("gpu_assemble_integralop_v2.jl")
-
+export assembleblock_gpu!, CuMatrixStore
 end
