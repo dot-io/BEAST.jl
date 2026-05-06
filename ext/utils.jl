@@ -248,3 +248,39 @@ function assembleblock_primer_gpu(biop, tfs, bfs; loop_order=:gather)
         test_shapes, trial_shapes,
     )
 end
+
+@inline function compute_pair_entry(
+    ::Type{T},
+    operator, test_shapes, trial_shapes,
+    test_element, trial_element,
+    i::Int32, j::Int32,
+    test_qp,  t_off::Int32, t_len::Int32,
+    trial_qp, b_off::Int32, b_len::Int32,
+) where {T}
+    igd = Integrand(operator, test_shapes, trial_shapes, test_element, trial_element)
+    acc = zero(T)
+
+    oi = Int32(0)
+    while oi < t_len
+        @inbounds womp = test_qp[t_off + oi]
+        tgeo  = womp.point
+        tvals = womp.value
+        jx    = womp.weight
+
+        ii = Int32(0)
+        while ii < b_len
+            @inbounds wimp = trial_qp[b_off + ii]
+            bgeo  = wimp.point
+            bvals = wimp.value
+            jy    = wimp.weight
+
+            z1 = igd(tgeo, bgeo, tvals, bvals)   # M × N matrix of integrand values
+            acc += jx * jy * z1[i, j]            # extract only the (i, j) entry
+                                                # here some expensive recomputation happens
+            ii += Int32(1)
+        end
+        oi += Int32(1)
+    end
+
+    return acc
+end

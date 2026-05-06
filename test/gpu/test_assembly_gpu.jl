@@ -11,77 +11,123 @@ else
     const BEASTCUDAExt = Base.get_extension(BEAST, :BEASTCUDAExt)
     @assert BEASTCUDAExt !== nothing "BEASTCUDAExt failed to load."
 
-    using .BEASTCUDAExt: assembleblock_gpu!, CuMatrixStore
+    using .BEASTCUDAExt: assembleblock_gpu, assembleblock_primer_gpu,
+        assembleblock_body_gpu!, CuMatrixStore
 
-
-    # Build CPU-side primer data and bundle the device-resident inputs that
-    # `assembleblock_body_gpu!` expects. Returns a NamedTuple holding everything
-    # both the GPU call and the post-hoc reference comparison need.
+    const ALL_KERNELS = (:scatter, :gather_entry, :gather_tile, :gather_tile_coop)
 
     """
-    run_gpu_block(biop::IntegralOperator, tfs::Space, test_ids::Vector{Int},
-                bfs::Space, trial_ids::Vector{Int}, ctx::NamedTuple) -> Z::Matrix
+        test_gpu_block(op, tfs, bfs, test_ids, trial_ids; kernel)
 
-    Executes `assembleblock_body_gpu!` for the given dof subsets and context,
-    accumulating results into a host matrix `Z` sized to the subset dimensions.
-    Argument `ctx` is return value of assembleblock_primer_gpu(...), which holds
-    all the device-resident data that `assembleblock_body_gpu!` needs, as well
-    as the GPU quadrature strategy to use.
-"""
-    function test_host_block(biop, tfs, test_ids, bfs, trial_ids)
-        ZT = BEAST.scalartype(biop, tfs, bfs)
+    Run a single GPU assembly for the given operator, spaces, and DOF subsets
+    using the requested kernel, returning the result as a host `Matrix`.
+    """
+    function test_gpu_block(op, tfs, bfs, test_ids, trial_ids; kernel)
+        ZT = BEAST.scalartype(op, tfs, bfs)
         Z_dev = CUDA.zeros(ZT, length(test_ids), length(trial_ids))
         store = CuMatrixStore(Z_dev)
 
-        assembleblock_gpu!(biop, tfs, bfs, store; test_ids, trial_ids)
+        ctx = assembleblock_primer_gpu(op, tfs, bfs; kernel)
+        assembleblock_body_gpu!(op, tfs, test_ids, bfs, trial_ids, ctx, store; kernel)
 
         return Array(Z_dev)
     end
 
-    @testset "GPU block assembly — Maxwell3D singlelayer × RT(sphere5)" begin
-        sphere = readmesh(joinpath(@__DIR__, "..", "assets", "sphere5.in"), T=Float64)
-        sphere_trans = translate(sphere, [0.0, 0.0, 4.0]) # ensure far-field geometry for testing
+    # ── Shared far-field geometry ────────────────────────────────────────
+    # Two separated spheres guarantee that every (test, trial) element pair
+    # is well-separated, so the GPU kernel's DoubleQuadRule-only path is
+    # sufficient (no Sauter-Schwab or WiltonSE needed).
+
+    sphere_a = readmesh(joinpath(@__DIR__, "..", "assets", "sphere5.in"), T=Float64)
+    sphere_b = translate(sphere_a, [0.0, 0.0, 4.0])
+
+    # ── Maxwell3D tests ──────────────────────────────────────────────────
+
+    @testset "Maxwell3D" begin
         k = 2π / 200.0
-        op = Maxwell3D.singlelayer(wavenumber=k)
-        X = raviartthomas(sphere)
-        X_trans = raviartthomas(sphere_trans)
-        A_ref = assemble(op, X, X_trans)
+        X_a = raviartthomas(sphere_a)
+        X_b = raviartthomas(sphere_b)
+        ndofs = numfunctions(X_a)
 
-        @testset "full block matches assemble(op, X, X)" begin
-            ndofs = numfunctions(X)
-            Z = test_host_block(op, X, collect(1:ndofs), X_trans, collect(1:ndofs))
-            @test Z ≈ A_ref atol = sqrt(eps(Float64))
+        @testset "singlelayer" begin
+            op = Maxwell3D.singlelayer(wavenumber=k)
+            A_ref = assemble(op, X_a, X_b)
+
+            @testset "full block — kernel=$ker" for ker in ALL_KERNELS
+                Z = test_gpu_block(op, X_a, X_b,
+                    collect(1:ndofs), collect(1:ndofs); kernel=ker)
+                @test Z ≈ A_ref atol=sqrt(eps(Float64))
+            end
+
+            @testset "subset block — kernel=$ker" for ker in ALL_KERNELS
+                I = [3, 2, 7]
+                J = [11, 5, 9, 1]
+                Z = test_gpu_block(op, X_a, X_b, I, J; kernel=ker)
+                @test Z ≈ A_ref[I, J] atol=sqrt(eps(Float64))
+            end
         end
 
-        @testset "subset block matches A_ref[I, J]" begin
-            I = [3, 2, 7]
-            J = [11, 5, 9, 1]
-            Z = test_host_block(op, X, I, X_trans, J)
-            @test Z ≈ A_ref[I, J] atol = sqrt(eps(Float64))
-        end
+        @testset "doublelayer" begin
+            op = Maxwell3D.doublelayer(wavenumber=k)
+            A_ref = assemble(op, X_a, X_b)
 
-        @testset "disjoint subset — far-field block" begin
-            # Non-overlapping dof subsets ensure all interactions take the
-            # DoubleQuadRule path the GPU kernel is specialised for.
-            I = collect(1:5)
-            J = collect((numfunctions(X)-4):numfunctions(X))
-            Z = test_host_block(op, X, I, X_trans, J)
-            @test Z ≈ A_ref[I, J] atol = sqrt(eps(Float64))
+            @testset "full block — kernel=$ker" for ker in ALL_KERNELS
+                Z = test_gpu_block(op, X_a, X_b,
+                    collect(1:ndofs), collect(1:ndofs); kernel=ker)
+                @test Z ≈ A_ref atol=sqrt(eps(Float64))
+            end
+
+            @testset "subset block — kernel=$ker" for ker in ALL_KERNELS
+                I = [3, 2, 7]
+                J = [11, 5, 9, 1]
+                Z = test_gpu_block(op, X_a, X_b, I, J; kernel=ker)
+                @test Z ≈ A_ref[I, J] atol=sqrt(eps(Float64))
+            end
         end
     end
 
-    @testset "GPU block assembly — Maxwell3D doublelayer × RT(sphere5)" begin
-        sphere = readmesh(joinpath(@__DIR__, "..", "assets", "sphere5.in"), T=Float64)
-        sphere_trans = translate(sphere, [0.0, 0.0, 4.0]) # ensure far-field geometry for testing
-        k = 2π / 200.0
-        op = Maxwell3D.doublelayer(wavenumber=k)
-        X = raviartthomas(sphere)
-        X_trans = raviartthomas(sphere_trans)
+    # ── Helmholtz3D tests ────────────────────────────────────────────────
 
-        A_ref = assemble(op, X, X_trans)
+    @testset "Helmholtz3D" begin
+        k = 1.0
+        Y_a = lagrangec0(sphere_a)
+        Y_b = lagrangec0(sphere_b)
+        ndofs = numfunctions(Y_a)
 
-        ndofs = numfunctions(X)
-        Z = test_host_block(op, X, collect(1:ndofs), X_trans, collect(1:ndofs))
-        @test Z ≈ A_ref atol = sqrt(eps(Float64))
+        @testset "singlelayer" begin
+            op = Helmholtz3D.singlelayer(wavenumber=k)
+            A_ref = assemble(op, Y_a, Y_b)
+
+            @testset "full block — kernel=$ker" for ker in ALL_KERNELS
+                Z = test_gpu_block(op, Y_a, Y_b,
+                    collect(1:ndofs), collect(1:ndofs); kernel=ker)
+                @test Z ≈ A_ref atol=sqrt(eps(Float64))
+            end
+
+            @testset "subset block — kernel=$ker" for ker in ALL_KERNELS
+                I = [3, 2, 7]
+                J = [11, 5, 9, 1]
+                Z = test_gpu_block(op, Y_a, Y_b, I, J; kernel=ker)
+                @test Z ≈ A_ref[I, J] atol=sqrt(eps(Float64))
+            end
+        end
+
+        @testset "doublelayer" begin
+            op = Helmholtz3D.doublelayer(wavenumber=k)
+            A_ref = assemble(op, Y_a, Y_b)
+
+            @testset "full block — kernel=$ker" for ker in ALL_KERNELS
+                Z = test_gpu_block(op, Y_a, Y_b,
+                    collect(1:ndofs), collect(1:ndofs); kernel=ker)
+                @test Z ≈ A_ref atol=sqrt(eps(Float64))
+            end
+
+            @testset "subset block — kernel=$ker" for ker in ALL_KERNELS
+                I = [3, 2, 7]
+                J = [11, 5, 9, 1]
+                Z = test_gpu_block(op, Y_a, Y_b, I, J; kernel=ker)
+                @test Z ≈ A_ref[I, J] atol=sqrt(eps(Float64))
+            end
+        end
     end
 end
