@@ -4,8 +4,8 @@ function tile_gather_kernel!(
     output,                     # CuMatrix{T} of size (M_block, N_block)
     op, test_shapes, trial_shapes,
     test_elements, bsis_elements,
-    inv_tad::InvAssemblyData{T},   # m → list of (p, i, a)
-    inv_bad::InvAssemblyData{T},   # n → list of (q, j, b)
+    inv_tad_flat::CuDeviceVector{Tuple{Int32,Int32,T},1}, inv_tad_offsets, inv_tad_lengths,
+    inv_bad_flat::CuDeviceVector{Tuple{Int32,Int32,T},1}, inv_bad_offsets, inv_bad_lengths,
     test_id_map, trial_id_map,
     tqp_flat, tqp_offsets, tqp_lengths,
     bqp_flat, bqp_offsets, bqp_lengths,
@@ -25,18 +25,18 @@ function tile_gather_kernel!(
     @inbounds m_global = test_id_map[m_local]
     @inbounds n_global = trial_id_map[n_local]
 
-    @inbounds t_off = inv_tad.offsets[m_global]
-    @inbounds t_len = inv_tad.lengths[m_global]
-    @inbounds b_off = inv_bad.offsets[n_global]
-    @inbounds b_len = inv_bad.lengths[n_global]
+    @inbounds t_off = inv_tad_offsets[m_global]
+    @inbounds t_len = inv_tad_lengths[m_global]
+    @inbounds b_off = inv_bad_offsets[n_global]
+    @inbounds b_len = inv_bad_lengths[n_global]
 
     acc = zero(T)
     ti = Int32(0)
     while ti < t_len
-        @inbounds (p, i, a) = inv_tad.flat[t_off + ti] # (test element, test shape fn. index, weight)
+        @inbounds (p, i, a) = inv_tad_flat[t_off+ti] # (test element, test shape fn. index, weight)
         bi = Int32(0)
         while bi < b_len
-            @inbounds (q, j, b) = inv_bad.flat[b_off + bi] # (trial element, basis shape fn. index, weight)
+            @inbounds (q, j, b) = inv_bad_flat[b_off+bi] # (trial element, basis shape fn. index, weight)
             z_ij = compute_pair_entry(T,
                 op, test_shapes, trial_shapes,
                 test_elements[p], bsis_elements[q],

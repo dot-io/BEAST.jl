@@ -197,57 +197,6 @@ function flatten_quaddata_gpu(quadrature_data, n_test, n_trial)
         bqp_lengths=CUDA.cu(bqp_lengths),
     )
 end
-"""
-
-     assembleblock_primer_gpu(biop::IntegralOperator, tfs::Space, bfs::Space) -> ctx::NamedTuple
-
-     Computes block assembly data, element geometry and quadrature data on the
-     CPU and transfers this to the device.
-     """
-function assembleblock_primer_gpu(biop, tfs, bfs; loop_order=:gather)
-    qs = BEAST.defaultquadstrat(biop, tfs, bfs)
-    test_elements, tad, trial_elements, bad, qd, _ =
-        BEAST.assembleblock_primer(biop, tfs, bfs; quadstrat=qs) #Still computes CPU side elements and assemblydata, THEN copies to GPU
-
-    ZT = scalartype(biop, tfs, bfs)
-    num_tfs = numfunctions(tfs)
-    num_bfs = numfunctions(bfs)
-    tgeo = geometry(tfs)
-    bgeo = geometry(bfs)
-    tdom = domain(chart(tgeo, first(tgeo)))
-    bdom = domain(chart(bgeo, first(bgeo)))
-    num_tshapes = numfunctions(refspace(tfs), tdom)
-    num_bshapes = numfunctions(refspace(bfs), bdom)
-    test_shapes = refspace(tfs)
-    trial_shapes = refspace(bfs)
-
-    test_elements_dev = CUDA.cu(test_elements)
-    trial_elements_dev = CUDA.cu(trial_elements)
-    if loop_order == :gather
-        tad_gpu = InvAssemblyData(tad, length(test_elements), num_tshapes, num_tfs, ZT)
-        bad_gpu = InvAssemblyData(bad, length(trial_elements), num_bshapes, num_bfs, ZT)
-    elseif loop_order == :scatter
-        tad_gpu = FlattenedAssemblyData(tad, length(test_elements), num_tshapes, ZT)
-        bad_gpu = FlattenedAssemblyData(bad, length(trial_elements), num_bshapes, ZT)
-    end
-
-    # Flatten quadrature data into device arrays. The GPU module is expected
-    # to provide `flatten_quaddata_gpu`; if it doesn't yet, this line is the
-    # signal that the helper still has to land alongside `gpu_2.jl`.
-    quaddata_gpu = flatten_quaddata_gpu(qd, length(test_elements), length(trial_elements))
-
-    zlocals = CUDA.zeros(ZT, num_tshapes, num_bshapes)
-
-    return (;
-        qs, ZT,
-        test_elements, trial_elements,
-        tad, bad, qd,
-        test_elements_dev, trial_elements_dev,
-        tad_gpu, bad_gpu, quaddata_gpu,
-        num_tshapes, num_bshapes, zlocals,
-        test_shapes, trial_shapes,
-    )
-end
 
 @inline function compute_pair_entry(
     ::Type{T},

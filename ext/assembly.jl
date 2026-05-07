@@ -144,9 +144,12 @@ function _launch_scatter!(biop, tfs, test_ids, bfs, trial_ids, ctx, store)
     # Kernel 1 per-pair integrand evaluation
     kernel = @cuda launch = false momintegrals!(
         zlocals_all_dev,
-        biop, ctx.test_shapes, ctx.trial_shapes,
+        biop,
+        ctx.test_shapes, ctx.trial_shapes,
         ctx.test_elements_dev, ctx.trial_elements_dev,
         test_id_dev, trial_id_dev,
+        ctx.tad_gpu.flat, ctx.tad_gpu.offsets, ctx.tad_gpu.lengths,
+        ctx.bad_gpu.flat, ctx.bad_gpu.offsets, ctx.bad_gpu.lengths,
         ctx.quaddata_gpu.tqp_flat, ctx.quaddata_gpu.tqp_offsets, ctx.quaddata_gpu.tqp_lengths,
         ctx.quaddata_gpu.bqp_flat, ctx.quaddata_gpu.bqp_offsets, ctx.quaddata_gpu.bqp_lengths,
         Int32(ctx.num_tshapes), Int32(ctx.num_bshapes), num_test, num_trial,
@@ -156,9 +159,12 @@ function _launch_scatter!(biop, tfs, test_ids, bfs, trial_ids, ctx, store)
     blocks  = cld(num_pairs, threads)
     kernel(
         zlocals_all_dev,
-        biop, ctx.test_shapes, ctx.trial_shapes,
+        biop,
+        ctx.test_shapes, ctx.trial_shapes,
         ctx.test_elements_dev, ctx.trial_elements_dev,
         test_id_dev, trial_id_dev,
+        ctx.tad_gpu.flat, ctx.tad_gpu.offsets, ctx.tad_gpu.lengths,
+        ctx.bad_gpu.flat, ctx.bad_gpu.offsets, ctx.bad_gpu.lengths,
         ctx.quaddata_gpu.tqp_flat, ctx.quaddata_gpu.tqp_offsets, ctx.quaddata_gpu.tqp_lengths,
         ctx.quaddata_gpu.bqp_flat, ctx.quaddata_gpu.bqp_offsets, ctx.quaddata_gpu.bqp_lengths,
         Int32(ctx.num_tshapes), Int32(ctx.num_bshapes), num_test, num_trial;
@@ -169,8 +175,7 @@ function _launch_scatter!(biop, tfs, test_ids, bfs, trial_ids, ctx, store)
     test_id_map_dev, trial_id_map_dev = create_id_maps(test_ids, trial_ids)
     gpu_scatter!(
         store.data, zlocals_all_dev,
-        ctx.tad_gpu.flat, ctx.tad_gpu.offsets, ctx.tad_gpu.lengths,
-        ctx.bad_gpu.flat, ctx.bad_gpu.offsets, ctx.bad_gpu.lengths,
+        ctx.tad_gpu, ctx.bad_gpu,
         test_id_dev, trial_id_dev,
         test_id_map_dev, trial_id_map_dev,
         ctx.num_tshapes, ctx.num_bshapes,
@@ -180,7 +185,11 @@ end
 
 # v2 entry-stationary gather (one BLOCK per output entry, in-block reduction)
 function _launch_gather_entry!(biop, tfs, test_ids, bfs, trial_ids, ctx, store)
-    test_id_map_dev, trial_id_map_dev = create_id_maps(test_ids, trial_ids)
+    # Local→global maps: local_index -> global_dof_id
+    # The gather kernels need to convert per-thread local indices into global
+    # DOF ids for looking up InvAssemblyData offsets/lengths.
+    test_l2g  = CUDA.cu(Int32.(test_ids))
+    trial_l2g = CUDA.cu(Int32.(trial_ids))
     M_block = Int32(length(test_ids))
     N_block = Int32(length(trial_ids))
 
@@ -191,7 +200,7 @@ function _launch_gather_entry!(biop, tfs, test_ids, bfs, trial_ids, ctx, store)
         ctx.test_elements_dev, ctx.trial_elements_dev,
         ctx.tad_gpu.flat, ctx.tad_gpu.offsets, ctx.tad_gpu.lengths,
         ctx.bad_gpu.flat, ctx.bad_gpu.offsets, ctx.bad_gpu.lengths,
-        test_id_map_dev, trial_id_map_dev,
+        test_l2g, trial_l2g,
         ctx.quaddata_gpu.tqp_flat, ctx.quaddata_gpu.tqp_offsets, ctx.quaddata_gpu.tqp_lengths,
         ctx.quaddata_gpu.bqp_flat, ctx.quaddata_gpu.bqp_offsets, ctx.quaddata_gpu.bqp_lengths,
     )
@@ -200,7 +209,8 @@ end
 
 # v3 tile-stationary gather, Layer 1 (one thread per output entry, no atomics)
 function _launch_gather_tile!(biop, tfs, test_ids, bfs, trial_ids, ctx, store)
-    test_id_map_dev, trial_id_map_dev = create_id_maps(test_ids, trial_ids)
+    test_l2g  = CUDA.cu(Int32.(test_ids))
+    trial_l2g = CUDA.cu(Int32.(trial_ids))
     M_block = Int32(length(test_ids))
     N_block = Int32(length(trial_ids))
     M_tile  = TILE_SIZE                # from utils.jl
@@ -212,7 +222,7 @@ function _launch_gather_tile!(biop, tfs, test_ids, bfs, trial_ids, ctx, store)
         ctx.test_elements_dev, ctx.trial_elements_dev,
         ctx.tad_gpu.flat, ctx.tad_gpu.offsets, ctx.tad_gpu.lengths,
         ctx.bad_gpu.flat, ctx.bad_gpu.offsets, ctx.bad_gpu.lengths,
-        test_id_map_dev, trial_id_map_dev,
+        test_l2g, trial_l2g,
         ctx.quaddata_gpu.tqp_flat, ctx.quaddata_gpu.tqp_offsets, ctx.quaddata_gpu.tqp_lengths,
         ctx.quaddata_gpu.bqp_flat, ctx.quaddata_gpu.bqp_offsets, ctx.quaddata_gpu.bqp_lengths,
         M_block, N_block,
@@ -223,7 +233,8 @@ end
 # v4 tile-stationary gather with cooperative integrand evaluation in shared memory
 # (prevents recomputing integrands)
 function _launch_gather_tile_coop!(biop, tfs, test_ids, bfs, trial_ids, ctx, store)
-    test_id_map_dev, trial_id_map_dev = create_id_maps(test_ids, trial_ids)
+    test_l2g  = CUDA.cu(Int32.(test_ids))
+    trial_l2g = CUDA.cu(Int32.(trial_ids))
     M_block = Int32(length(test_ids))
     N_block = Int32(length(trial_ids))
     M_tile  = TILE_SIZE
@@ -238,12 +249,13 @@ function _launch_gather_tile_coop!(biop, tfs, test_ids, bfs, trial_ids, ctx, sto
         ctx.test_elements_dev, ctx.trial_elements_dev,
         ctx.tad_gpu.flat, ctx.tad_gpu.offsets, ctx.tad_gpu.lengths,
         ctx.bad_gpu.flat, ctx.bad_gpu.offsets, ctx.bad_gpu.lengths,
-        test_id_map_dev, trial_id_map_dev,
+        test_l2g, trial_l2g,
         ctx.quaddata_gpu.tqp_flat, ctx.quaddata_gpu.tqp_offsets, ctx.quaddata_gpu.tqp_lengths,
         ctx.quaddata_gpu.bqp_flat, ctx.quaddata_gpu.bqp_offsets, ctx.quaddata_gpu.bqp_lengths,
         pair_flat, pair_off,
         M_block, N_block, n_tiles_m,
-        Val(Int(ctx.num_tshapes)), Val(Int(ctx.num_bshapes)),
+        Int32(ctx.num_tshapes), Int32(ctx.num_bshapes),
+        Val(M_tile), Val(N_tile),
     )
     return
 end

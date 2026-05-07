@@ -34,8 +34,8 @@ function gather_reduce_kernel!(
     output,                # CuMatrix{T}, output rows × cols
     op, test_shapes, trial_shapes,
     test_elements, bsis_elements,
-    inv_tad::InvAssemblyData{T},   # flipped tad
-    inv_bad::InvAssemblyData{T},   # flipped bad
+    inv_tad_flat::CuDeviceVector{Tuple{Int32,Int32,T},1}, inv_tad_offsets, inv_tad_lengths,
+    inv_bad_flat::CuDeviceVector{Tuple{Int32,Int32,T},1}, inv_bad_offsets, inv_bad_lengths,
     test_id_map, trial_id_map,     # block-local → global dof
     tqp_flat, tqp_offsets, tqp_lengths,
     bqp_flat, bqp_offsets, bqp_lengths,
@@ -51,8 +51,8 @@ function gather_reduce_kernel!(
 
     # Number of contributing (p, i, a) and (q, j, b)
     # TODO; should i add inbounds calls?
-    t_off, t_len = inv_tad.offsets[m_global], inv_tad.lengths[m_global]
-    b_off, b_len = inv_bad.offsets[n_global], inv_bad.lengths[n_global]
+    t_off, t_len = inv_tad_offsets[m_global], inv_tad_lengths[m_global]
+    b_off, b_len = inv_bad_offsets[n_global], inv_bad_lengths[n_global]
 
     # Each thread takes a slice of the (t_len × b_len) cross product. TODO: huh?
     tid = threadIdx().x
@@ -64,11 +64,11 @@ function gather_reduce_kernel!(
     while k < total
         ti = div(k, b_len) + Int32(1)
         bi = mod(k, b_len) + Int32(1)
-        @inbounds (p, i, a) = inv_tad.flat[t_off+ti-Int32(1)]
-        @inbounds (q, j, b) = inv_bad.flat[b_off+bi-Int32(1)]
+        @inbounds (p, i, a) = inv_tad_flat[t_off+ti-Int32(1)]
+        @inbounds (q, j, b) = inv_bad_flat[b_off+bi-Int32(1)]
 
         # Compute z_{ij}^{(p,q)} on the fly — full quadrature loop
-        z_ij = compute_pair_entry(op, test_shapes, trial_shapes,
+        z_ij = compute_pair_entry(T, op, test_shapes, trial_shapes,
             test_elements[p], bsis_elements[q],
             i, j,
             tqp_flat, tqp_offsets[p], tqp_lengths[p],

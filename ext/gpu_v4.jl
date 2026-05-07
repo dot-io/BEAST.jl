@@ -1,98 +1,31 @@
-# Gathering-based implementation 3: shared memory reduction of integrand matrix
+# # Gathering-based implementation 3: shared memory reduction of integrand matrix
 
-"""
-    assembleblock_gpu!(biop, tfs, bfs, store; test_ids, trial_ids)
+# """
+#     assembleblock_gpu!(biop, tfs, bfs, store; test_ids, trial_ids)
 
-Call a primer routine, followed by the block assembly body.
-See also [`assembleblock_primer_gpu`](@ref) and
-[`assembleblock_body_gpu!`](@ref).
-"""
-function assembleblock_gpu!(
-    biop, tfs, bfs, store;
-    test_ids=collect(keys(tfs.fns)),
-    trial_ids=collect(keys(bfs.fns)),
-)
+# Call a primer routine, followed by the block assembly body.
+# See also [`assembleblock_primer_gpu`](@ref) and
+# [`assembleblock_body_gpu!`](@ref).
+# """
+# function assembleblock_gpu!(
+#     biop, tfs, bfs, store;
+#     test_ids=collect(keys(tfs.fns)),
+#     trial_ids=collect(keys(bfs.fns)),
+# )
 
-    ctx::NamedTuple = assembleblock_primer_gpu(biop, tfs, bfs, loop_order=:gather)
+#     ctx::NamedTuple = assembleblock_primer_gpu(biop, tfs, bfs, loop_order=:gather)
 
-    assembleblock_body_gpu!(
-        biop,
-        tfs, test_ids, ctx.test_elements_dev, ctx.tad_gpu,
-        bfs, trial_ids, ctx.trial_elements_dev, ctx.bad_gpu,
-        ctx.quaddata_gpu, ctx.zlocals,
-        ctx.num_tshapes, ctx.num_bshapes,
-        store;
-        quadstrat=ctx.qs,
-        ctx.test_shapes, ctx.trial_shapes,
-    )
-end
-
-
-"""
-    assembleblock_body_gpu!(biop, tfs, bfs; loop_order=:gather)
-
-Launch a user-chosen CUDA kernel that computes the system matrix for test
-basis `tfs` and trial basis `bfs` with bilinear operator `biop`.
-
-See also [`tile_gather_cooperative_kernel!`](@ref) for the kernel implementation.
-"""
-function assembleblock_body_gpu!(
-    biop,
-    tfs,
-    test_ids,
-    test_elements_dev,   # CuArray{Simplex} for the CUDA kernel
-    test_assembly_dev,   # CuArray (tad.data) reserved for future GPU scatter
-    bfs,
-    trial_ids,
-    bsis_elements_dev,   # CuArray{Simplex}
-    trial_assembly_dev,  # CuArray (bad.data)
-    quaddata_gpu,        # NamedTuple of flattened quad-point CuArrays
-    zlocals,             # CuMatrix (M×N scratch, used for eltype/size)
-    num_tshapes,
-    num_bshapes,
-    store::DeviceStore;
-    quadstrat,
-    test_shapes, trial_shapes,
-)
-
-    # Local-to-global maps: local_index -> global_dof_id
-    # The kernel needs to convert its per-thread local index into the
-    # global DOF id used by InvAssemblyData offsets/lengths.
-    test_l2g = CUDA.cu(Int32.(test_ids))
-    trial_l2g = CUDA.cu(Int32.(trial_ids))
-
-    M_tile = Int32(16)   # tile size for test functions (rows)
-    N_tile = Int32(16)   # tile size for trial functions (cols)
-    pair_flat::CuArray{Tuple{Int32,Int32}}, pair_off::CuArray{Int32} = build_tile_pairs(test_ids, trial_ids, tfs, bfs, M_tile, N_tile)
-
-    n_tiles_m = Int32(cld(length(test_ids), M_tile))
-    n_tiles_n = Int32(cld(length(trial_ids), N_tile))
-
-    M_total = Int32(length(test_ids))
-    N_total = Int32(length(trial_ids))
-
-    @cuda threads = (M_tile, N_tile) blocks = (n_tiles_m, n_tiles_n) tile_gather_cooperative_kernel!(
-        store.data,
-        biop,
-        test_shapes,
-        trial_shapes,
-        test_elements_dev,
-        bsis_elements_dev,
-        test_assembly_dev.flat, test_assembly_dev.offsets, test_assembly_dev.lengths,
-        trial_assembly_dev.flat, trial_assembly_dev.offsets, trial_assembly_dev.lengths,
-        test_l2g,
-        trial_l2g,
-        quaddata_gpu.tqp_flat, quaddata_gpu.tqp_offsets, quaddata_gpu.tqp_lengths,
-        quaddata_gpu.bqp_flat, quaddata_gpu.bqp_offsets, quaddata_gpu.bqp_lengths,
-        pair_flat, pair_off,
-        M_total, N_total, n_tiles_m,
-        Int32(num_tshapes), Int32(num_bshapes),
-        Val(M_tile), Val(N_tile),
-    )
-    return
-
-
-end
+#     assembleblock_body_gpu!(
+#         biop,
+#         tfs, test_ids, ctx.test_elements_dev, ctx.tad_gpu,
+#         bfs, trial_ids, ctx.trial_elements_dev, ctx.bad_gpu,
+#         ctx.quaddata_gpu, ctx.zlocals,
+#         ctx.num_tshapes, ctx.num_bshapes,
+#         store;
+#         quadstrat=ctx.qs,
+#         ctx.test_shapes, ctx.trial_shapes,
+#     )
+# end
 
 """
     build_tile_pairs(test_ids, trial_ids, tfs, bfs, M_tile, N_tile)
@@ -174,7 +107,6 @@ function tile_gather_cooperative_kernel!(
     pair_lo = pair_off[tile_idx] # first element pair of the 'tile'
     # last element pair of the 'tile'
     pair_hi = pair_off[tile_idx+Int32(1)] - Int32(1)
-    `                                               `
     # the test DoF to be used by the thread
     m_local = (blockIdx().x - Int32(1)) * blockDim().x + tx
     # the trial DoF to be used by the thread
