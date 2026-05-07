@@ -139,23 +139,25 @@ end
 
 
 """
-    create_id_maps(test_ids, trial_ids)
+    create_id_maps(test_ids, trial_ids, num_tfs, num_bfs)
 
 Create global → local-in-block index mappings for test and trial functions.
 
 Returns `(test_id_map, trial_id_map)` as CuVectors where:
 - `test_id_map[m] = i` if global basis function `m` is the `i`-th function in the block
 - `test_id_map[m] = 0` if `m` is not in this block
+
+The maps are sized to `num_tfs` and `num_bfs` respectively so that any
+DOF ID appearing in the AssemblyData can be safely looked up.
 """
 function create_id_maps(
     test_ids::AbstractVector{Int},
     trial_ids::AbstractVector{Int},
+    num_tfs::Int,
+    num_bfs::Int,
 )
-    max_test = isempty(test_ids) ? 0 : maximum(test_ids)
-    max_trial = isempty(trial_ids) ? 0 : maximum(trial_ids)
-
-    test_id_map = zeros(Int32, max_test)
-    trial_id_map = zeros(Int32, max_trial)
+    test_id_map = zeros(Int32, num_tfs)
+    trial_id_map = zeros(Int32, num_bfs)
 
     for (i, m) in enumerate(test_ids)
         test_id_map[m] = i
@@ -165,6 +167,18 @@ function create_id_maps(
     end
 
     return CUDA.cu(test_id_map), CUDA.cu(trial_id_map)
+end
+
+# Legacy overload: sizes maps to maximum(test_ids)/maximum(trial_ids).
+# WARNING: this may be too small if AssemblyData references DOF IDs outside
+# the provided test_ids/trial_ids. Prefer the 4-argument version.
+function create_id_maps(
+    test_ids::AbstractVector{Int},
+    trial_ids::AbstractVector{Int},
+)
+    max_test = isempty(test_ids) ? 0 : maximum(test_ids)
+    max_trial = isempty(trial_ids) ? 0 : maximum(trial_ids)
+    return create_id_maps(test_ids, trial_ids, max_test, max_trial)
 end
 
 
@@ -203,7 +217,7 @@ end
     operator, test_shapes, trial_shapes,
     test_element, trial_element,
     i::Int32, j::Int32,
-    test_qp,  t_off::Int32, t_len::Int32,
+    test_qp, t_off::Int32, t_len::Int32,
     trial_qp, b_off::Int32, b_len::Int32,
 ) where {T}
     igd = Integrand(operator, test_shapes, trial_shapes, test_element, trial_element)
@@ -211,21 +225,21 @@ end
 
     oi = Int32(0)
     while oi < t_len
-        @inbounds womp = test_qp[t_off + oi]
-        tgeo  = womp.point
+        @inbounds womp = test_qp[t_off+oi]
+        tgeo = womp.point
         tvals = womp.value
-        jx    = womp.weight
+        jx = womp.weight
 
         ii = Int32(0)
         while ii < b_len
-            @inbounds wimp = trial_qp[b_off + ii]
-            bgeo  = wimp.point
+            @inbounds wimp = trial_qp[b_off+ii]
+            bgeo = wimp.point
             bvals = wimp.value
-            jy    = wimp.weight
+            jy = wimp.weight
 
             z1 = igd(tgeo, bgeo, tvals, bvals)   # M × N matrix of integrand values
             acc += jx * jy * z1[i, j]            # extract only the (i, j) entry
-                                                # here some expensive recomputation happens
+            # here some expensive recomputation happens
             ii += Int32(1)
         end
         oi += Int32(1)

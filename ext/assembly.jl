@@ -36,35 +36,36 @@ buffers depends on `kernel` — scatter needs `FlattenedAssemblyData`, gather
 needs `InvAssemblyData`. The chosen `kernel` is stored in `ctx.kernel` so the
 body can later validate consistency.
 """
-function assembleblock_primer_gpu(biop, tfs, bfs; kernel::Symbol = :gather_tile_coop)
+function assembleblock_primer_gpu(biop, tfs, bfs; kernel::Symbol=:gather_tile_coop)
     kernel ∈ _VALID_KERNELS || error("kernel=$kernel not in $_VALID_KERNELS")
     loop_order = _loop_order(kernel)
 
     qs = BEAST.defaultquadstrat(biop, tfs, bfs)
     test_elements, tad, trial_elements, bad, qd, _ =
-        BEAST.assembleblock_primer(biop, tfs, bfs; quadstrat = qs)
+        BEAST.assembleblock_primer(biop, tfs, bfs; quadstrat=qs)
 
     ZT = scalartype(biop, tfs, bfs)
     num_tfs = numfunctions(tfs)
     num_bfs = numfunctions(bfs)
 
-    tgeo = geometry(tfs); bgeo = geometry(bfs)
+    tgeo = geometry(tfs)
+    bgeo = geometry(bfs)
     tdom = domain(chart(tgeo, first(tgeo)))
     bdom = domain(chart(bgeo, first(bgeo)))
     num_tshapes = numfunctions(refspace(tfs), tdom)
     num_bshapes = numfunctions(refspace(bfs), bdom)
 
-    test_shapes  = refspace(tfs)
+    test_shapes = refspace(tfs)
     trial_shapes = refspace(bfs)
 
-    test_elements_dev  = CUDA.cu(test_elements)
+    test_elements_dev = CUDA.cu(test_elements)
     trial_elements_dev = CUDA.cu(trial_elements)
 
     if loop_order === :gather
-        tad_gpu = InvAssemblyData(tad, length(test_elements),  num_tshapes, num_tfs, ZT)
+        tad_gpu = InvAssemblyData(tad, length(test_elements), num_tshapes, num_tfs, ZT)
         bad_gpu = InvAssemblyData(bad, length(trial_elements), num_bshapes, num_bfs, ZT)
     else  # :scatter
-        tad_gpu = FlattenedAssemblyData(tad, length(test_elements),  num_tshapes, ZT)
+        tad_gpu = FlattenedAssemblyData(tad, length(test_elements), num_tshapes, ZT)
         bad_gpu = FlattenedAssemblyData(bad, length(trial_elements), num_bshapes, ZT)
     end
 
@@ -94,7 +95,7 @@ Launch the kernel(s) for the requested implementation. `ctx` must come from
 function assembleblock_body_gpu!(
     biop, tfs, test_ids, bfs, trial_ids,
     ctx, store::DeviceStore;
-    kernel::Symbol = ctx.kernel,
+    kernel::Symbol=ctx.kernel,
 )
     kernel ∈ _VALID_KERNELS || error("kernel=$kernel not in $_VALID_KERNELS")
     _loop_order(kernel) === _loop_order(ctx.kernel) ||
@@ -121,9 +122,9 @@ end
 Full-block convenience function: run the primer and body for the entire dof set of
 `tfs x bfs`. The result is accumulated into `store.data`.
 """
-function assembleblock_gpu(biop, tfs, bfs, store; kernel::Symbol = :gather_tile_coop)
-    ctx       = assembleblock_primer_gpu(biop, tfs, bfs; kernel)
-    test_ids  = collect(1:numfunctions(tfs))
+function assembleblock_gpu(biop, tfs, bfs, store; kernel::Symbol=:gather_tile_coop)
+    ctx = assembleblock_primer_gpu(biop, tfs, bfs; kernel)
+    test_ids = collect(1:numfunctions(tfs))
     trial_ids = collect(1:numfunctions(bfs))
     assembleblock_body_gpu!(biop, tfs, test_ids, bfs, trial_ids, ctx, store; kernel)
 end
@@ -135,7 +136,7 @@ end
 function _launch_scatter!(biop, tfs, test_ids, bfs, trial_ids, ctx, store)
     test_id_dev, trial_id_dev =
         filter_and_copy_dev(tfs, bfs, test_ids, trial_ids)
-    num_test  = Int32(length(test_id_dev))
+    num_test = Int32(length(test_id_dev))
     num_trial = Int32(length(trial_id_dev))
     num_pairs = Int(num_test) * Int(num_trial)
 
@@ -154,9 +155,9 @@ function _launch_scatter!(biop, tfs, test_ids, bfs, trial_ids, ctx, store)
         ctx.quaddata_gpu.bqp_flat, ctx.quaddata_gpu.bqp_offsets, ctx.quaddata_gpu.bqp_lengths,
         Int32(ctx.num_tshapes), Int32(ctx.num_bshapes), num_test, num_trial,
     )
-    config  = launch_configuration(kernel.fun)
+    config = launch_configuration(kernel.fun)
     threads = min(num_pairs, config.threads)
-    blocks  = cld(num_pairs, threads)
+    blocks = cld(num_pairs, threads)
     kernel(
         zlocals_all_dev,
         biop,
@@ -171,8 +172,9 @@ function _launch_scatter!(biop, tfs, test_ids, bfs, trial_ids, ctx, store)
         threads, blocks,
     )
 
-    # Kernel 2 scatter into the output via shared-memory tiles
-    test_id_map_dev, trial_id_map_dev = create_id_maps(test_ids, trial_ids)
+    # Kernel 2 scatter into the output (direct global-memory atomics by default)
+    # Pass variant=:tiled to gpu_scatter! for shared-memory tile reduction
+    test_id_map_dev, trial_id_map_dev = create_id_maps(test_ids, trial_ids, ctx.num_tfs, ctx.num_bfs)
     gpu_scatter!(
         store.data, zlocals_all_dev,
         ctx.tad_gpu, ctx.bad_gpu,
@@ -188,13 +190,13 @@ function _launch_gather_entry!(biop, tfs, test_ids, bfs, trial_ids, ctx, store)
     # Local→global maps: local_index -> global_dof_id
     # The gather kernels need to convert per-thread local indices into global
     # DOF ids for looking up InvAssemblyData offsets/lengths.
-    test_l2g  = CUDA.cu(Int32.(test_ids))
+    test_l2g = CUDA.cu(Int32.(test_ids))
     trial_l2g = CUDA.cu(Int32.(trial_ids))
     M_block = Int32(length(test_ids))
     N_block = Int32(length(trial_ids))
 
     threads = 256                     # tunable; warp-multiple recommended
-    blocks  = (M_block, N_block)
+    blocks = (M_block, N_block)
     @cuda threads = threads blocks = blocks gather_reduce_kernel!(
         store.data, biop, ctx.test_shapes, ctx.trial_shapes,
         ctx.test_elements_dev, ctx.trial_elements_dev,
@@ -209,13 +211,13 @@ end
 
 # v3 tile-stationary gather, Layer 1 (one thread per output entry, no atomics)
 function _launch_gather_tile!(biop, tfs, test_ids, bfs, trial_ids, ctx, store)
-    test_l2g  = CUDA.cu(Int32.(test_ids))
+    test_l2g = CUDA.cu(Int32.(test_ids))
     trial_l2g = CUDA.cu(Int32.(trial_ids))
     M_block = Int32(length(test_ids))
     N_block = Int32(length(trial_ids))
-    M_tile  = TILE_SIZE                # from utils.jl
-    N_tile  = TILE_SIZE
-    blocks  = (cld(M_block, M_tile), cld(N_block, N_tile))
+    M_tile = TILE_SIZE                # from utils.jl
+    N_tile = TILE_SIZE
+    blocks = (cld(M_block, M_tile), cld(N_block, N_tile))
 
     @cuda threads = (M_tile, N_tile) blocks = blocks tile_gather_kernel!(
         store.data, biop, ctx.test_shapes, ctx.trial_shapes,
@@ -233,12 +235,12 @@ end
 # v4 tile-stationary gather with cooperative integrand evaluation in shared memory
 # (prevents recomputing integrands)
 function _launch_gather_tile_coop!(biop, tfs, test_ids, bfs, trial_ids, ctx, store)
-    test_l2g  = CUDA.cu(Int32.(test_ids))
+    test_l2g = CUDA.cu(Int32.(test_ids))
     trial_l2g = CUDA.cu(Int32.(trial_ids))
     M_block = Int32(length(test_ids))
     N_block = Int32(length(trial_ids))
-    M_tile  = TILE_SIZE
-    N_tile  = TILE_SIZE
+    M_tile = TILE_SIZE
+    N_tile = TILE_SIZE
     n_tiles_m = cld(M_block, M_tile)
     n_tiles_n = cld(N_block, N_tile)
 

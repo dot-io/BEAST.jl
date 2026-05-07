@@ -23,7 +23,7 @@ include("gpu_v4.jl")    # tile-stationary gather Layer 2    — :gather_tile_coo
 include("assembly.jl")
 
 export assembleblock_gpu, assembleblock_body_gpu!, assembleblock_primer_gpu,
-       CuMatrixStore, DeviceStore,
-       FlattenedAssemblyData, InvAssemblyData
+    CuMatrixStore, DeviceStore,
+    FlattenedAssemblyData, InvAssemblyData
 
 end
