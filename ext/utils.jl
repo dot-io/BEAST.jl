@@ -247,3 +247,129 @@ end
 
     return acc
 end
+
+# ===========================================================================
+# Helper: extract active element ids and upload to device
+# ===========================================================================
+
+function filter_and_copy_dev(tfs, bfs, test_ids, trial_ids)
+
+    active_test_el_ids = Int32[]
+    active_trial_el_ids = Int32[]
+
+    test_id_in_blk = Dict{Int,Int}()
+    trial_id_in_blk = Dict{Int,Int}()
+
+    for (i, m) in enumerate(test_ids)
+        test_id_in_blk[m] = i
+    end
+    for (i, m) in enumerate(trial_ids)
+        trial_id_in_blk[m] = i
+    end
+
+    for m in test_ids, sh in tfs.fns[m]
+        push!(active_test_el_ids, Int32(sh.cellid))
+    end
+    for m in trial_ids, sh in bfs.fns[m]
+        push!(active_trial_el_ids, Int32(sh.cellid))
+    end
+
+    active_test_el_ids = unique!(sort!(active_test_el_ids))
+    active_trial_el_ids = unique!(sort!(active_trial_el_ids))
+
+    (isempty(active_test_el_ids) || isempty(active_trial_el_ids)) && return
+
+
+    # If I remove these assertions I don't have to pass the CPU arrays anymore. This doesnt cost anything however
+    # @assert maximum(active_test_el_ids) <= length(test_elements)
+    # @assert maximum(active_trial_el_ids) <= length(bsis_elements)
+
+    # Transfer active element id lists to GPU
+    active_test_ids_dev = CUDA.cu(active_test_el_ids)
+    active_trial_ids_dev = CUDA.cu(active_trial_el_ids)
+
+    return active_test_ids_dev, active_trial_ids_dev
+end
+
+
+# ===========================================================================
+# Kernel 1: per-pair integrand evaluation (shared by both scatter variants)
+# ===========================================================================
+
+function momintegrals!(
+    output::CuDeviceArray{T,3},
+    op,
+    test_shapes,
+    trial_shapes,
+    test_elements,
+    bsis_elements,
+    active_test_ids,
+    active_trial_ids,
+    tad_flat, tad_offsets, tad_lengths,
+    bad_flat, bad_offsets, bad_lengths,
+    tqp_flat, tqp_offsets, tqp_lengths,
+    bqp_flat, bqp_offsets, bqp_lengths,
+    num_tshapes::Int32,
+    num_bshapes::Int32,
+    num_test::Int32,
+    num_trial::Int32,
+) where {T}
+
+    idx = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
+    total_pairs = num_test * num_trial
+    idx > total_pairs && return
+
+    # One thread per (p, q) element pair
+    p_local = mod(idx - Int32(1), num_test) + Int32(1)
+    q_local = div(idx - Int32(1), num_test) + Int32(1)
+
+    @inbounds p = active_test_ids[p_local]
+    @inbounds q = active_trial_ids[q_local]
+
+    tcell = test_elements[p]
+    bcell = bsis_elements[q]
+    igd = Integrand(op, test_shapes, trial_shapes, tcell, bcell)
+
+    o_off = tqp_offsets[p]
+    o_len = tqp_lengths[p]
+    i_off = bqp_offsets[q]
+    i_len = bqp_lengths[q]
+
+    # Compute each zlocal[i, j] entry independently
+    i = Int32(1)
+    while i <= num_tshapes
+        j = Int32(1)
+        while j <= num_bshapes
+            acc = zero(T)
+
+            oi = Int32(0)
+            while oi < o_len
+                @inbounds womp = tqp_flat[o_off+oi]
+                tgeo = womp.point
+                tvals = womp.value
+                jx = womp.weight
+
+                ii = Int32(0)
+                while ii < i_len
+                    @inbounds wimp = bqp_flat[i_off+ii]
+                    bgeo = wimp.point
+                    bvals = wimp.value
+                    jy = wimp.weight
+
+                    z1 = igd(tgeo, bgeo, tvals, bvals)
+                    acc += (jx * jy) * z1[i, j]
+
+                    ii += Int32(1)
+                end
+
+                oi += Int32(1)
+            end
+
+            @inbounds output[i, j, idx] = acc
+            j += Int32(1)
+        end
+        i += Int32(1)
+    end
+
+    return nothing
+end
