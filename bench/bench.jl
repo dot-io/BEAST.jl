@@ -7,10 +7,10 @@ using Plots
 using BenchmarkTools
 
 const K = 2π / 200.0
-const BEASTCUDAExt = Base.get_extension(BEAST, :BEASTCUDAExt)
-@assert BEASTCUDAExt !== nothing "BEASTCUDAExt failed to load."
+const BEASTCUDA = Base.get_extension(BEAST, :BEASTCUDA)
+@assert BEASTCUDA !== nothing "BEASTCUDA failed to load."
 
-using .BEASTCUDAExt: assembleblock_gpu, assembleblock_primer_gpu,
+using .BEASTCUDA: assembleblock_gpu, assembleblock_primer_gpu,
     assembleblock_body_gpu!, CuMatrixStore
 
 const KERNEL_ORDER = (:gather_tile, :pair_scatter, :sparse, :hybrid_global, :hybrid_shared)
@@ -236,4 +236,175 @@ function main()
 end
 
 
+"""
+    rowcol_scenarios(n_test, n_trial) -> Vector{Tuple{String,Vector{Int},Vector{Int}}}
+
+Return the four H-matrix-style index subsets:
+1. One wide row  (1 test DOF  × 320 trial DOFs)
+2. One tall col  (320 test DOFs × 1 trial DOF)
+3. Four discontiguous rows × 80 trial DOFs
+4. 80 test DOFs × four discontiguous trial cols
+"""
+function rowcol_scenarios(n_test::Int, n_trial::Int)
+    row_w  = min(320, n_trial)
+    col_h  = min(320, n_test)
+    multi_w = min(80, n_trial)
+    multi_h = min(80, n_test)
+
+    # four evenly-spaced, discontiguous DOF ids
+    discontig_test  = [clamp(round(Int, i * n_test  / 5), 1, n_test)  for i in 1:4]
+    discontig_trial = [clamp(round(Int, i * n_trial / 5), 1, n_trial) for i in 1:4]
+
+    return [
+        ("1×$(row_w) (wide row)",        [n_test ÷ 2],    collect(1:row_w)),
+        ("$(col_h)×1 (tall col)",        collect(1:col_h), [n_trial ÷ 2]),
+        ("4×$(multi_w) (discontig rows)", discontig_test,  collect(1:multi_w)),
+        ("$(multi_h)×4 (discontig cols)", collect(1:multi_h), discontig_trial),
+    ]
+end
+
+
+"""
+    benchmark_dof_scenarios(label, op, X, X2; scenarios, n_repeats, kernels)
+
+Build one GPU primer per kernel (reusable across blocks), then time the body-only
+call for each (test_ids, trial_ids) scenario.
+
+Returns `Dict{String, Dict{Symbol, Float64}}` mapping scenario name → kernel → median body time (s).
+"""
+function benchmark_dof_scenarios(label, op, X, X2;
+    scenarios,
+    n_repeats::Int=5,
+    kernels=KERNEL_ORDER)
+
+    @info "Row/column scenario benchmark: $label"
+    ZT = BEAST.scalartype(op, X, X2)
+
+    primers = Dict{Symbol,Any}()
+    for kernel in kernels
+        try
+            primers[kernel] = assembleblock_primer_gpu(op, X, X2; kernel)
+        catch e
+            @warn "  Primer build failed for $kernel: $e"
+        end
+    end
+
+    results = Dict{String,Dict{Symbol,Float64}}()
+
+    for (name, test_ids, trial_ids) in scenarios
+        @info "  Scenario: \"$name\"  ($(length(test_ids)) × $(length(trial_ids)))"
+        results[name] = Dict{Symbol,Float64}()
+
+        for kernel in kernels
+            haskey(primers, kernel) || continue
+            ctx = primers[kernel]
+            try
+                # warmup (excludes JIT from timings)
+                Z_dev = CUDA.zeros(ZT, length(test_ids), length(trial_ids))
+                assembleblock_body_gpu!(op, X, test_ids, X2, trial_ids, ctx,
+                    CuMatrixStore(Z_dev); kernel)
+                CUDA.synchronize()
+
+                times = Float64[]
+                for _ in 1:n_repeats
+                    Z_dev = CUDA.zeros(ZT, length(test_ids), length(trial_ids))
+                    t = CUDA.@elapsed begin
+                        assembleblock_body_gpu!(op, X, test_ids, X2, trial_ids, ctx,
+                            CuMatrixStore(Z_dev); kernel)
+                        CUDA.synchronize()
+                    end
+                    push!(times, t)
+                end
+
+                med = median(times)
+                results[name][kernel] = med
+                @info "    $(rpad(string(kernel), 18)) $(round(med * 1e3; digits=3)) ms"
+            catch e
+                @warn "    $kernel failed: $e"
+                results[name][kernel] = NaN
+            end
+        end
+    end
+
+    return results
+end
+
+
+"""
+    _plot_dof_scenarios(label_rt, label_lg, scenarios, rt_results, lg_results; suffix)
+
+2×2 subplot grid showing body-only time (ms) per scenario and kernel.
+RT and Lagrange bars are side by side within each subplot.
+"""
+function _plot_dof_scenarios(label_rt, label_lg, scenarios, rt_results, lg_results; suffix="")
+    scenario_names = [s[1] for s in scenarios]
+    present_kernels = [k for k in KERNEL_ORDER
+        if any(!isnan(get(get(rt_results, n, Dict()), k, NaN)) ||
+               !isnan(get(get(lg_results, n, Dict()), k, NaN))
+           for n in scenario_names)]
+    isempty(present_kernels) && (@warn "No scenario results to plot."; return)
+
+    n_kernels = length(present_kernels)
+    klabels = string.(present_kernels)
+    x = collect(1:n_kernels)
+    bar_width = 0.35
+
+    subplots = []
+    for name in scenario_names
+        rt_ms = [get(get(rt_results, name, Dict()), k, NaN) * 1e3 for k in present_kernels]
+        lg_ms = [get(get(lg_results, name, Dict()), k, NaN) * 1e3 for k in present_kernels]
+
+        p = bar(x .- bar_width/2, rt_ms;
+            bar_width=bar_width, label=label_rt, color=:steelblue,
+            title=name, ylabel="Body time (ms)", xlabel="Kernel",
+            legend=:topright, minorgrid=true,
+            left_margin=5Plots.mm, bottom_margin=14Plots.mm,
+            xticks=(x, klabels), xrotation=30)
+        bar!(x .+ bar_width/2, lg_ms; bar_width=bar_width, label=label_lg, color=:coral)
+        push!(subplots, p)
+    end
+
+    combined = plot(subplots...; layout=(2, 2), size=(1600, 900))
+    outfile = joinpath(@__DIR__, "rowcol_scenarios$(suffix).png")
+    savefig(combined, outfile)
+    @info "Scenario plot saved to $outfile"
+    return combined
+end
+
+
+function main_rowcol()
+    for (h_val, dof_label) in h_dof_configs
+        @info "=== Row/col scenarios  h=$h_val (~$dof_label DOFs) ==="
+        sphere  = meshsphere(radius=1.0, h=h_val)
+        sphere2 = CompScienceMeshes.translate(sphere, [0.0, 0.0, 4.0])
+
+        rt_op  = Maxwell3D.singlelayer(wavenumber=K)
+        X_rt   = raviartthomas(sphere)
+        X2_rt  = raviartthomas(sphere2)
+
+        hh_op  = Helmholtz3D.singlelayer(gamma=im * K)
+        X_lg   = lagrangec0d1(sphere; dirichlet=false)
+        X2_lg  = lagrangec0d1(sphere2; dirichlet=false)
+
+        scenarios_rt = rowcol_scenarios(numfunctions(X_rt),  numfunctions(X2_rt))
+        scenarios_lg = rowcol_scenarios(numfunctions(X_lg), numfunctions(X2_lg))
+
+        rt_results = benchmark_dof_scenarios(
+            "RT / Maxwell3D ($dof_label DOFs)", rt_op, X_rt, X2_rt;
+            scenarios=scenarios_rt, n_repeats=5)
+        lg_results = benchmark_dof_scenarios(
+            "Lagrange / Helmholtz3D ($dof_label DOFs)", hh_op, X_lg, X2_lg;
+            scenarios=scenarios_lg, n_repeats=5)
+
+        # Plot using RT scenario names (same structure as Lagrange)
+        _plot_dof_scenarios(
+            "RT ($(numfunctions(X_rt)) DOFs)",
+            "Lagrange ($(numfunctions(X_lg)) DOFs)",
+            scenarios_rt, rt_results, lg_results;
+            suffix="_$(dof_label)_dofs")
+    end
+end
+
+
 main()
+main_rowcol()
