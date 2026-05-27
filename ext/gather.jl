@@ -1,0 +1,52 @@
+function tile_gather_kernel!(
+    output,                     # CuMatrix{T} of size (M_block, N_block)
+    op, test_shapes, trial_shapes,
+    test_elements, bsis_elements,
+    inv_tad_flat::CuDeviceVector{Tuple{Int32,Int32,T},1}, inv_tad_offsets, inv_tad_lengths,
+    inv_bad_flat::CuDeviceVector{Tuple{Int32,Int32,T},1}, inv_bad_offsets, inv_bad_lengths,
+    test_id_map, trial_id_map,
+    tqp_flat, tqp_offsets, tqp_lengths,
+    bqp_flat, bqp_offsets, bqp_lengths,
+    M_block::Int32, N_block::Int32,
+) where {T}
+    # Output entry this thread owns
+    tile_m_start = (blockIdx().x - Int32(1)) * blockDim().x + Int32(1)
+    tile_n_start = (blockIdx().y - Int32(1)) * blockDim().y + Int32(1)
+    m_local = tile_m_start + threadIdx().x - Int32(1)
+    n_local = tile_n_start + threadIdx().y - Int32(1)
+
+    (m_local > M_block || n_local > N_block) && return
+
+    @inbounds m_global = test_id_map[m_local]
+    @inbounds n_global = trial_id_map[n_local]
+
+    @inbounds t_off = inv_tad_offsets[m_global]
+    @inbounds t_len = inv_tad_lengths[m_global]
+    @inbounds b_off = inv_bad_offsets[n_global]
+    @inbounds b_len = inv_bad_lengths[n_global]
+
+    acc = zero(T)
+    ti = Int32(0)
+    @inbounds while ti < t_len
+        (p, i, a) = inv_tad_flat[t_off+ti]
+        bi = Int32(0)
+        while bi < b_len
+            (q, j, b) = inv_bad_flat[b_off+bi]
+            z_ij = compute_pair_entry(T,
+                op, test_shapes, trial_shapes,
+                test_elements[p], bsis_elements[q],
+                i, j,
+                tqp_flat, tqp_offsets[p], tqp_lengths[p],
+                bqp_flat, bqp_offsets[q], bqp_lengths[q],
+            )
+            acc += a * z_ij * b
+            bi += Int32(1)
+        end
+        ti += Int32(1)
+    end
+
+    # output[m_local, n_local] is column-major: threads with adjacent
+    # threadIdx().x (and thus adjacent m_local) write adjacent memory → coalesced
+    @inbounds output[m_local, n_local] = acc
+    return
+end
