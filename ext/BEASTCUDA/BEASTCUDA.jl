@@ -21,7 +21,7 @@ include("gpu_warp_scatter.jl")
 
 module SparseImpl
 using CUDA
-using CUDA.Adapt
+using Adapt
 using CUDA.CUSPARSE
 using BEAST
 import BEAST: assemble!, Threading, Operator, Space, IntegralOperator

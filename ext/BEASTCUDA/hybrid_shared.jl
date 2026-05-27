@@ -1,6 +1,7 @@
 using CompScienceMeshes: MeshPointNM, Simplex, SVector
-using CUDA: CuVector, CuMatrix, CuArray, @cuda, @cuStaticSharedMem,
+using CUDA: CuVector, CuMatrix, CuArray, @cuda, CuDynamicSharedArray,
     @inbounds, synchronize
+using CUDA
 
 
 """
@@ -29,7 +30,9 @@ function hybrid_shared_kernel!(
 ) where {T,CT,CB,NS,MS,TILE,K_max_t,K_max_b}
 
     LD = TILE + Int32(1)
-    Z_tile = @cuStaticSharedMem(T, (LD, K_max_t, K_max_b, TILE))
+    # Dynamic shared memory: size set at launch via the `shmem=` keyword, and
+    # opted past the 48KB static cap via cuFuncSetAttribute in the launcher.
+    Z_tile = CuDynamicSharedArray(T, (LD, K_max_t, K_max_b, TILE))
 
     m_loc = threadIdx().x   # 1..TILE
     n_loc = threadIdx().y   # 1..TILE
@@ -150,7 +153,7 @@ end
 
 
 """
-    _pick_hybrid_shared_tile(K_max_t, K_max_b, sizeof_T; limit_bytes=167936) -> Int
+    _pick_hybrid_shared_tile(K_max_t, K_max_b, sizeof_T; limit_bytes=164 KiB) -> Int
 
 Choose the largest supported tile size that fits within `limit_bytes` of static
 shared memory for the given problem.
@@ -160,13 +163,32 @@ or `0` if even the smallest tile does not fit (caller should fall back to
 :hybrid_global).
 """
 function _pick_hybrid_shared_tile(K_max_t::Int, K_max_b::Int, sizeof_T::Int;
-                                  limit_bytes::Int=167936)
-    for tile in (16, 8, 4)
-        if (tile + 1) * K_max_t * K_max_b * tile * sizeof_T <= limit_bytes
+                                  limit_bytes::Int=164*1024)
+    for tile in 2048:-4:0 # max threads per block is 2048
+        if tile * K_max_t * K_max_b * tile * sizeof_T <= limit_bytes
+            print(tile, "\n")
             return tile
         end
     end
     return 0
+end
+
+
+"""
+    _hybrid_shared_smem_limit() -> Int
+
+Per-block dynamic-shared-memory cap to request via `CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES`.
+We probe the device's `MAX_SHARED_MEMORY_PER_BLOCK_OPTIN` attribute and fall
+back to a conservative 99KB (Volta+ guarantees ≥ 96KB opt-in).
+"""
+function _hybrid_shared_smem_limit()
+    try
+        dev = CUDA.device()
+        return Int(CUDA.attribute(dev,
+            CUDA.CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN))
+    catch
+        return 164 * 1024
+    end
 end
 
 
@@ -196,11 +218,13 @@ function gpu_hybrid_shared!(
     K_max_t = Int(had.K_max_test)
     K_max_b = Int(had.K_max_trial)
 
-    tile = _pick_hybrid_shared_tile(K_max_t, K_max_b, sizeof(T))
+    tile = _pick_hybrid_shared_tile(K_max_t, K_max_b, sizeof(T);
+                                    limit_bytes=_hybrid_shared_smem_limit())
     if tile == 0
-        smallest = (4 + 1) * K_max_t * K_max_b * 4 * sizeof(T)
+        smallest = (4) * K_max_t * K_max_b * 4 * sizeof(T)
         error("hybrid_shared: even tile=4 needs $(smallest) bytes of shared memory " *
-              "(> 49152 limit). K_max_t=$K_max_t, K_max_b=$K_max_b, sizeof(T)=$(sizeof(T)). " *
+              "(> $(_hybrid_shared_smem_limit()) device opt-in limit). " *
+              "K_max_t=$K_max_t, K_max_b=$K_max_b, sizeof(T)=$(sizeof(T)). " *
               "Use :hybrid_global instead.")
     end
 
@@ -259,8 +283,10 @@ end
 
     pair_flat, pair_off = build_tile_pairs(test_ids, trial_ids, tfs, bfs, TILE, TILE)
 
-    @cuda threads = (TILE, TILE) blocks = (n_tiles_m, n_tiles_n) hybrid_shared_kernel!(
-        output, biop, test_shapes, trial_shapes,
+    # Dynamic shared memory size: matches the CuDynamicSharedArray dims in the kernel.
+    shmem_bytes = (TILE + 1) * K_max_t * K_max_b * TILE * sizeof(T)
+
+    args = (output, biop, test_shapes, trial_shapes,
         test_elements_dev, trial_elements_dev,
         had.fwd_tad.flat, had.fwd_tad.offsets, had.fwd_tad.lengths,
         had.fwd_bad.flat, had.fwd_bad.offsets, had.fwd_bad.lengths,
@@ -272,8 +298,25 @@ end
         pair_flat, pair_off,
         M_block, N_block, Int32(n_tiles_m),
         Val(num_tshapes), Val(num_bshapes),
-        Val(TILE), Val(K_max_t), Val(K_max_b),
-    )
+        Val(TILE), Val(K_max_t), Val(K_max_b))
+
+    kf = @cuda launch=false hybrid_shared_kernel!(args...)
+
+    # Opt past the 48KB static cap. Only needed when shmem_bytes > 48KB but
+    # cheap to always set; the attribute is per-function and cached by the driver.
+    if shmem_bytes > 48 * 1024
+        limit = _hybrid_shared_smem_limit()
+        shmem_bytes <= limit ||
+            error("hybrid_shared: requested $(shmem_bytes) B dynamic shared memory " *
+                  "exceeds device opt-in cap $(limit) B. Use :hybrid_global.")
+        CUDA.cuFuncSetAttribute(
+            kf.fun,
+            CUDA.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+            shmem_bytes,
+        )
+    end
+
+    kf(args...; threads=(TILE, TILE), blocks=(n_tiles_m, n_tiles_n), shmem=shmem_bytes)
 
     CUDA.synchronize()
     return output
