@@ -26,7 +26,7 @@ Flattened AssemblyData struct. Contains:
 - flat: device memory mapping an index to data (need to be more specific)
 - offsets : A 2D matrix on devmem containing the offsets for each index of assembly data
 
-N.B.: Assembly data type is parametrized because it may be complex or require different precision. TODO: i should check if this is actually the case.
+N.B.: Assembly data type is parametrized because it may be complex or require different precision.
 In any case Julia's polymorphism should mean no performance overhead except at compile-time.
 """
 
@@ -142,13 +142,6 @@ end
     create_id_maps(test_ids, trial_ids, num_tfs, num_bfs)
 
 Create global → local-in-block index mappings for test and trial functions.
-
-Returns `(test_id_map, trial_id_map)` as CuVectors where:
-- `test_id_map[m] = i` if global basis function `m` is the `i`-th function in the block
-- `test_id_map[m] = 0` if `m` is not in this block
-
-The maps are sized to `num_tfs` and `num_bfs` respectively so that any
-DOF ID appearing in the AssemblyData can be safely looked up.
 """
 function create_id_maps(
     test_ids::AbstractVector{Int},
@@ -168,10 +161,9 @@ function create_id_maps(
 
     return CUDA.cu(test_id_map), CUDA.cu(trial_id_map)
 end
+u
 
-# Legacy overload: sizes maps to maximum(test_ids)/maximum(trial_ids).
-# WARNING: this may be too small if AssemblyData references DOF IDs outside
-# the provided test_ids/trial_ids. Prefer the 4-argument version.
+#legacy TODO remove refs
 function create_id_maps(
     test_ids::AbstractVector{Int},
     trial_ids::AbstractVector{Int},
@@ -248,10 +240,220 @@ end
     return acc
 end
 
-# ===========================================================================
-# Helper: extract active element ids and upload to device
-# ===========================================================================
 
+"""
+    accumulate_zlocal_ntuple(::Type{T}, op, test_shapes, trial_shapes, tcell, bcell,
+        tqp_flat, t_off, t_len, bqp_flat, b_off, b_len,
+        ::Val{NS}, ::Val{MS}) -> NTuple{NS*MS, T}
+"""
+@inline function accumulate_zlocal_ntuple(::Type{T}, op,
+    test_shapes, trial_shapes, tcell, bcell,
+    tqp_flat, t_off::Int32, t_len::Int32,
+    bqp_flat, b_off::Int32, b_len::Int32,
+    ::Val{NS}, ::Val{MS},
+) where {T,NS,MS}
+    igd = Integrand(op, test_shapes, trial_shapes, tcell, bcell)
+    z = ntuple(_ -> zero(T), Val(NS * MS))
+
+    oi = Int32(0)
+    @inbounds while oi < t_len
+        womp = tqp_flat[t_off+oi]
+        tgeo = womp.point
+        tvals = womp.value
+        jx = womp.weight
+
+        ii = Int32(0)
+        while ii < b_len
+            wimp = bqp_flat[b_off+ii]
+            z1 = igd(tgeo, wimp.point, tvals, wimp.value)
+            jxjy = jx * wimp.weight
+
+            for j_acc in Int32(1):Int32(MS)
+                for i_acc in Int32(1):Int32(NS)
+                    flat_idx = (j_acc - Int32(1)) * Int32(NS) + i_acc
+                    z = Base.setindex(z, z[flat_idx] + jxjy * z1[i_acc, j_acc], flat_idx)
+                end
+            end
+
+            ii += Int32(1)
+        end
+        oi += Int32(1)
+    end
+
+    return z
+end
+
+
+struct FlattenedAssemblyDataWithK{T}
+    flat::CuVector{Tuple{Int32,Int32,T}}   # (dof_global, contributor_index_k, coefficient)
+    offsets::CuMatrix{Int32}               # indexed by (element, local_shape)
+    lengths::CuMatrix{Int32}
+    num_elements::Int32
+    num_local_shapes::Int32
+end
+
+"""
+    FlattenedAssemblyDataWithK constructor
+"""
+function FlattenedAssemblyDataWithK(
+    assembly_data,
+    num_elements::Int,
+    num_local_shapes::Int,
+    num_dofs::Int,
+    ::Type{T},
+) where {T}
+    # First, build the inverse map to determine contributor indices
+    inv_map = [Tuple{Int32,Int32,T}[] for _ in 1:num_dofs]
+    for p = 1:num_elements
+        for i = 1:num_local_shapes
+            for (m, coeff) in assembly_data[p, i]
+                push!(inv_map[m], (Int32(p), Int32(i), T(coeff)))
+            end
+        end
+    end
+
+    # Build forward map with k: for each (p, i) → (m, a), determine k
+    # by looking up the position of (p, i, a) in inv_map[m]
+    fwd_entries = Tuple{Int32,Int32,T}[]
+    offsets = zeros(Int32, num_elements, num_local_shapes)
+    lengths = zeros(Int32, num_elements, num_local_shapes)
+
+    for p = 1:num_elements
+        for i = 1:num_local_shapes
+            offsets[p, i] = length(fwd_entries) + 1
+            count = Int32(0)
+            for (m, a) in assembly_data[p, i]
+                # Find k: the position of (p, i, a) in inv_map[m]
+                k = Int32(0)
+                for (idx, entry) in enumerate(inv_map[m])
+                    if entry[1] == Int32(p) && entry[2] == Int32(i)
+                        k = Int32(idx)
+                        break
+                    end
+                end
+                @assert k > 0 "Could not find (p=$p, i=$i) in inv_map[m=$m]"
+                push!(fwd_entries, (Int32(m), k, T(a)))
+                count += 1
+            end
+            lengths[p, i] = count
+        end
+    end
+
+    return FlattenedAssemblyDataWithK{T}(
+        CUDA.cu(fwd_entries),
+        CUDA.cu(offsets),
+        CUDA.cu(lengths),
+        Int32(num_elements),
+        Int32(num_local_shapes),
+    )
+end
+
+# Length overload to get number of elements easily
+Base.length(fad::FlattenedAssemblyDataWithK) = fad.num_elements
+
+# Indexing overload as a convenience function
+function Base.getindex(
+    fad::FlattenedAssemblyDataWithK{T},
+    p::Int32,
+    i::Int32,
+) where {T}
+    off = fad.offsets[p, i]
+    len = fad.lengths[p, i]
+    return (@view fad.flat[off:(off+len-1)])
+end
+
+
+"""
+    HybridAssemblyData{T}
+
+Combined forward + inverse assembly data for the hybrid (biphasic) GPU kernels.
+"""
+struct HybridAssemblyData{T}
+    # Forward maps with contributor index k
+    fwd_tad::FlattenedAssemblyDataWithK{T}
+    fwd_bad::FlattenedAssemblyDataWithK{T}
+
+    # Inverse maps (same as InvAssemblyData)
+    inv_tad::InvAssemblyData{T}
+    inv_bad::InvAssemblyData{T}
+
+    # Zero-padded coefficient arrays for branchless Phase 2
+    coeff_test_padded::CuMatrix{T}    # [m, k] — coefficient a for the k-th contributor to test dof m
+    coeff_trial_padded::CuMatrix{T}   # [n, l] — coefficient b for the l-th contributor to trial dof n
+
+    # Maximum support sizes
+    K_max_test::Int32
+    K_max_trial::Int32
+end
+
+"""
+    HybridAssemblyData constructor
+
+"""
+function HybridAssemblyData(
+    tad_cpu,
+    bad_cpu,
+    num_test_elements::Int,
+    num_trial_elements::Int,
+    num_tshapes::Int,
+    num_bshapes::Int,
+    num_tfs::Int,
+    num_bfs::Int,
+    ::Type{T},
+) where {T}
+    # Build forward maps with contributor index k
+    fwd_tad = FlattenedAssemblyDataWithK(tad_cpu, num_test_elements, num_tshapes, num_tfs, T)
+    fwd_bad = FlattenedAssemblyDataWithK(bad_cpu, num_trial_elements, num_bshapes, num_bfs, T)
+
+    # Build inverse maps
+    inv_tad = InvAssemblyData(tad_cpu, num_test_elements, num_tshapes, num_tfs, T)
+    inv_bad = InvAssemblyData(bad_cpu, num_trial_elements, num_bshapes, num_bfs, T)
+
+    # Compute K_max values
+    K_max_test = isempty(inv_tad.lengths) ? Int32(1) : maximum(inv_tad.lengths)
+    K_max_trial = isempty(inv_bad.lengths) ? Int32(1) : maximum(inv_bad.lengths)
+
+    # Build padded coefficient arrays from CPU-side inverse maps
+    # (avoid scalar indexing on CuArrays)
+    # coeff_test_padded[m, k] = coefficient of the k-th contributor to test dof m
+    # coeff_trial_padded[n, l] = coefficient of the l-th contributor to trial dof n
+    coeff_test_padded = zeros(T, num_tfs, Int(K_max_test))
+    coeff_trial_padded = zeros(T, num_bfs, Int(K_max_trial))
+
+    # Rebuild CPU-side inverse maps for coefficient extraction
+    inv_map_test = [Tuple{Int32,Int32,T}[] for _ in 1:num_tfs]
+    inv_map_trial = [Tuple{Int32,Int32,T}[] for _ in 1:num_bfs]
+    for p in 1:num_test_elements, i in 1:num_tshapes
+        for (m, coeff) in tad_cpu[p, i]
+            push!(inv_map_test[m], (Int32(p), Int32(i), T(coeff)))
+        end
+    end
+    for q in 1:num_trial_elements, j in 1:num_bshapes
+        for (n, coeff) in bad_cpu[q, j]
+            push!(inv_map_trial[n], (Int32(q), Int32(j), T(coeff)))
+        end
+    end
+    for m in 1:num_tfs
+        for k in 1:length(inv_map_test[m])
+            coeff_test_padded[m, k] = inv_map_test[m][k][3]
+        end
+    end
+    for n in 1:num_bfs
+        for l in 1:length(inv_map_trial[n])
+            coeff_trial_padded[n, l] = inv_map_trial[n][l][3]
+        end
+    end
+
+    return HybridAssemblyData{T}(
+        fwd_tad, fwd_bad,
+        inv_tad, inv_bad,
+        CUDA.cu(coeff_test_padded), CUDA.cu(coeff_trial_padded),
+        K_max_test, K_max_trial,
+    )
+end
+
+
+# extract active element ids and upload to device
 function filter_and_copy_dev(tfs, bfs, test_ids, trial_ids)
 
     active_test_el_ids = Int32[]
@@ -292,10 +494,7 @@ function filter_and_copy_dev(tfs, bfs, test_ids, trial_ids)
 end
 
 
-# ===========================================================================
-# Kernel 1: per-pair integrand evaluation (shared by both scatter variants)
-# ===========================================================================
-
+# per pair integrand eval (used by scatter/gather)
 function momintegrals!(
     output::CuDeviceArray{T,3},
     op,
@@ -372,4 +571,46 @@ function momintegrals!(
     end
 
     return nothing
+end
+
+"""
+    build_tile_pairs(test_ids, trial_ids, tfs, bfs, M_tile, N_tile)
+    -> (pair_flat, pair_off)
+
+store all pairs that have contributions to a 'tile'.
+"""
+function build_tile_pairs(test_ids, trial_ids, tfs, bfs, M_tile, N_tile)
+    n_tiles_m = cld(length(test_ids), M_tile)
+    n_tiles_n = cld(length(trial_ids), N_tile)
+    pair_off = Int32[1]
+    pair_flat = Tuple{Int32,Int32}[]
+
+    # Linear tile index is tm + (tn - 1) * n_tiles_m
+    for tn in 1:n_tiles_n, tm in 1:n_tiles_m # inter-tile loop
+        # collect unique test elements supporting any dof in this tile's rows
+        pset = Set{Int32}() # where p stands for a test element index
+        for k in 1:M_tile # intra-tile loop
+            m_local = (tm - 1) * M_tile + k # local dof index within the tile
+            m_local > length(test_ids) && break
+            for sh in tfs.fns[test_ids[m_local]]
+                push!(pset, Int32(sh.cellid))
+            end
+        end
+        # idem for trial
+        qset = Set{Int32}()
+        for k in 1:N_tile
+            n_local = (tn - 1) * N_tile + k
+            n_local > length(trial_ids) && break
+            for sh in bfs.fns[trial_ids[n_local]]
+                push!(qset, Int32(sh.cellid))
+            end
+        end
+        for p in pset
+            for q in qset
+                push!(pair_flat, (p, q))
+            end
+        end
+        push!(pair_off, Int32(length(pair_flat) + 1))   # offset till next tile
+    end
+    return CUDA.cu(pair_flat), CUDA.cu(pair_off)
 end
