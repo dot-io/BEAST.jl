@@ -1,44 +1,3 @@
-# ===========================================================================
-# Hybrid Global — Biphasic kernel with Z in global memory
-# ===========================================================================
-#
-# Two-phase approach:
-#   Phase 1: Compute all integrand values z_{ij}^{(p,q)} and scatter them
-#            into a dof-renamed 4D intermediate matrix Z_padded stored in
-#            global memory. Layout: Z_padded[m, k, l, n] where m (test dof)
-#            varies fastest — chosen so that Phase 2's threads (with m =
-#            threadIdx().x) read stride-1 from Z_padded.
-#   Phase 2: One thread per output entry (m, n). Gather from Z_padded using
-#            zero-padded coefficient arrays. Branchless inner loops.
-#            Write output[m, n] directly — no atomics.
-#
-# Key properties:
-#   • Phase 1: one thread per element pair (p, q), grid-stride loop.
-#     Uses FlattenedAssemblyDataWithK (forward map with contributor index k)
-#     to scatter into Z_padded. No atomics needed because each (m,k,n,l)
-#     maps to a unique (p,i,q,j).
-#   • Phase 2: one thread per (m, n) reads Z_padded[m, k, l, n] with
-#     zero-padded coefficients. Fixed trip counts (K_max_test, K_max_trial
-#     as Val parameters) enable full loop unrolling and eliminate warp
-#     divergence in the inner loops.
-#
-# Memory layout note:
-#   Z_padded sized (M_block, K_max_t, K_max_b, N_block) gives stride-1
-#   coalesced access in Phase 2: thread (m,n) reads Z_padded[m, k, l, n] and
-#   threadIdx().x → m varies fastest across a warp, so adjacent threads read
-#   consecutive memory addresses. The previous layout [N,K_b,K_t,M] had
-#   stride N×K_b×K_t between adjacent threads — devastating for bandwidth.
-#
-# Trade-offs vs. hybrid_shared.jl:
-#   + Simpler: no tile pair lists, no shared memory sizing constraints
-#   + No barrier overhead (two separate kernels)
-#   + Works for any basis (tile size not limited by shared memory)
-#   - Z_padded lives in global memory → extra DRAM traffic
-#   - Z_padded peak memory is M*K_t*K_b*N*sizeof(T) — scales as O(n²);
-#     for n=10K with K_max=2 that's 6.4 GB. Future improvement: tile the
-#     output into M_TILE×N_TILE blocks to bound peak memory.
-#   - Two kernel launches (Phase 1 + Phase 2) vs. one fused kernel
-
 using CompScienceMeshes: MeshPointNM, Simplex, SVector
 using CUDA: CuVector, CuMatrix, CuArray, @cuda, @inbounds, synchronize
 
@@ -145,10 +104,6 @@ end
 """
     hybrid_global_phase2_kernel!(output, Z_padded, coeff_test_padded,
         coeff_trial_padded, M_block, N_block, ::Val{K_max_t}, ::Val{K_max_b})
-
-One thread per output entry (m, n). Reads Z_padded[m, k, l, n] with stride-1
-access patterns (m fastest in memory; adjacent threads adjacent m), combines
-with zero-padded coefficients in fully unrolled loops, writes output[m, n].
 """
 function hybrid_global_phase2_kernel!(
     output::CuDeviceMatrix{T},
@@ -166,10 +121,6 @@ function hybrid_global_phase2_kernel!(
 
     (m > M_block || n > N_block) && return
 
-    # coeff_*_padded are indexed by global DOF; Z_padded is indexed by local
-    # (m, n). Look up the corresponding global DOFs for this thread's local
-    # output entry so that arbitrary index subsets (e.g. those emitted by
-    # ACA pivoting) read the correct coefficients.
     @inbounds m_global = test_dof_ids[m]
     @inbounds n_global = trial_dof_ids[n]
 
@@ -258,7 +209,6 @@ function gpu_hybrid_global!(
 
     CUDA.synchronize()
 
-    # ── Phase 2 ──
     tile = Int(TILE_SIZE)
     threads2 = (tile, tile)
     blocks2 = (cld(Int(M_block), tile), cld(Int(N_block), tile))
