@@ -27,49 +27,6 @@
 #     )
 # end
 
-"""
-    build_tile_pairs(test_ids, trial_ids, tfs, bfs, M_tile, N_tile)
-    -> (pair_flat, pair_off)
-
-For each test function and each trial function of the 'tile', retrieve elements
-that belong to those respective test and trial functions and store all element
-pairs that have contributions to a 'tile'.
-"""
-function build_tile_pairs(test_ids, trial_ids, tfs, bfs, M_tile, N_tile)
-    n_tiles_m = cld(length(test_ids), M_tile)
-    n_tiles_n = cld(length(trial_ids), N_tile)
-    pair_off = Int32[1]
-    pair_flat = Tuple{Int32,Int32}[]
-
-    # Linear tile index is tm + (tn - 1) * n_tiles_m
-    for tn in 1:n_tiles_n, tm in 1:n_tiles_m # inter-tile loop
-        # collect unique test elements supporting any dof in this tile's rows
-        pset = Set{Int32}() # where p stands for a test element index
-        for k in 1:M_tile # intra-tile loop
-            m_local = (tm - 1) * M_tile + k # local dof index within the tile
-            m_local > length(test_ids) && break
-            for sh in tfs.fns[test_ids[m_local]]
-                push!(pset, Int32(sh.cellid))
-            end
-        end
-        # idem for trial
-        qset = Set{Int32}()
-        for k in 1:N_tile
-            n_local = (tn - 1) * N_tile + k
-            n_local > length(trial_ids) && break
-            for sh in bfs.fns[trial_ids[n_local]]
-                push!(qset, Int32(sh.cellid))
-            end
-        end
-        for p in pset
-            for q in qset
-                push!(pair_flat, (p, q))
-            end
-        end
-        push!(pair_off, Int32(length(pair_flat) + 1))   # offset till next tile
-    end
-    return CUDA.cu(pair_flat), CUDA.cu(pair_off)
-end
 
 """
     tile_gather_cooperative_kernel!(...)

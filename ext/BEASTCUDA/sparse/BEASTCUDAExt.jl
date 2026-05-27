@@ -1,4 +1,4 @@
-module BEASTCUDAExt
+module BEASTCUDA
 
 using CUDA
 using CUDA.Adapt

@@ -9,10 +9,10 @@ using CUDA
 if !CUDA.functional()
     @info "CUDA not functional — skipping GPU block-assembly tests"
 else
-    const BEASTCUDAExt = Base.get_extension(BEAST, :BEASTCUDAExt)
-    @assert BEASTCUDAExt !== nothing "BEASTCUDAExt failed to load."
+    const BEASTCUDA = Base.get_extension(BEAST, :BEASTCUDA)
+    @assert BEASTCUDA !== nothing "BEASTCUDA failed to load."
 
-    using .BEASTCUDAExt: assembleblock_gpu, assembleblock_primer_gpu,
+    using .BEASTCUDA: assembleblock_gpu, assembleblock_primer_gpu,
         assembleblock_body_gpu!, CuMatrixStore
 
     """
@@ -40,7 +40,7 @@ else
     """
     function test_all_kernels(biop, tfs, test_ids, bfs, trial_ids, A_ref;
         atol=sqrt(eps(Float64)), skip_sparse=false)
-        kernels = [:scatter, :gather_entry, :gather_tile, :gather_tile_coop]
+        kernels = [:scatter, :gather_entry, :gather_tile, :gather_tile_coop, :pair_scatter, :warp_scatter]
         !skip_sparse && push!(kernels, :sparse)
         for kernel in kernels
             @testset "kernel=$kernel" begin

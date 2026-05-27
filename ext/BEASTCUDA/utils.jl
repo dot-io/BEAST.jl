@@ -161,7 +161,6 @@ function create_id_maps(
 
     return CUDA.cu(test_id_map), CUDA.cu(trial_id_map)
 end
-u
 
 #legacy TODO remove refs
 function create_id_maps(

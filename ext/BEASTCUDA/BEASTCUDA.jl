@@ -1,4 +1,4 @@
-module BEASTCUDAExt
+module BEASTCUDA
 
 using CUDA
 using BEAST: BEAST, Integrand, scalartype, numfunctions, geometry, refspace
@@ -10,14 +10,14 @@ using SparseArrays
 include("utils.jl")
 
 # the different implementations one per file
-include("gpu_v1.jl")    # element-stationary scatter
-include("gpu_v1.5.jl")  # element-stationary scatter with shmem tiling
-include("gpu_v2.jl")    # entry-stationary gather (1 GPU block per dof pair)
-include("gpu_v3.jl")    # tile-stationary gather v1 (1 CUDA thread per dof pair)
-include("gpu_v4.jl")    # tile-stationary gather v2 (adds integrand precomputation)
+include("gather.jl")
+include("scatter.jl")
+include("hybrid_global.jl")  # biphasic kernel with Z in global memory
+include("hybrid_shared.jl")  # biphasic kernel with Z_tile in shared memory
+include("gpu_warp_scatter.jl")
 
 
-# Implementation using Sparse matrix multiplication to avoid contention; courtesy of Cedric Münger.
+# Implementation using Sparse matrix multiplication to avoid contention. courtesy of Cedric Münger.
 
 module SparseImpl
 using CUDA
@@ -57,7 +57,5 @@ include("assembly.jl")
 
 export assembleblock_gpu, assembleblock_body_gpu!, assembleblock_primer_gpu,
     CuMatrixStore, DeviceStore,
-    FlattenedAssemblyData, InvAssemblyData,
-    gpu_scatter_contention
-
+    FlattenedAssemblyData, InvAssemblyData, FlattenedAssemblyDataWithK, HybridAssemblyData
 end
